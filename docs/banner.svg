@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 360" width="1280" height="360" role="img" aria-label="m2c — mitmproxy2chDB: record every request your AI agents make into embedded ClickHouse, per session and per tool">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#131d33"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#6ea0ff"/>
+      <stop offset="1" stop-color="#9b7bff"/>
+    </linearGradient>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1" fill="#ffffff" opacity="0.05"/>
+    </pattern>
+    <marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#5b6b8c"/>
+    </marker>
+    <style>
+      .mono { font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .sans { font-family: Inter, "Segoe UI", system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif; }
+      .box { fill: #17233d; stroke: #2a3a5e; stroke-width: 1.5; }
+      .src { fill: #c8d1e6; font-size: 15px; }
+      .lbl { fill: #8b97b3; font-size: 13px; }
+      .wire { stroke: #3a4a6e; stroke-width: 2; fill: none; }
+      .pkt { fill: #6ea0ff; }
+      .row { font-size: 13.5px; fill: #c8d1e6; }
+      .dim { fill: #6b7896; }
+      .ok { fill: #69db7c; }
+      .warn { fill: #fcc419; }
+      .bad { fill: #ff8787; }
+      .tag { fill: #9b7bff; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="360" rx="20" fill="url(#bg)"/>
+  <rect width="1280" height="360" rx="20" fill="url(#dots)"/>
+
+  <!-- name and claim -->
+  <text x="64" y="86" class="mono" font-size="22" letter-spacing="1.5" fill="url(#accent)" font-weight="600">mitmproxy2chDB</text>
+  <text x="58" y="196" class="mono" font-size="124" font-weight="700" fill="#ffffff" letter-spacing="-4">m2c</text>
+  <text x="64" y="244" class="sans" font-size="24" fill="#dbe3f4">Record every request your AI agents make,</text>
+  <text x="64" y="276" class="sans" font-size="24" fill="#dbe3f4">per session and per tool, into embedded ClickHouse.</text>
+  <g class="mono" font-size="13" fill="#aebbd8">
+    <rect x="64" y="300" width="74" height="26" rx="13" fill="#1b2844" stroke="#2f4068"/><text x="101" y="318" text-anchor="middle">HTTP(S)</text>
+    <rect x="146" y="300" width="50" height="26" rx="13" fill="#1b2844" stroke="#2f4068"/><text x="171" y="318" text-anchor="middle">SSE</text>
+    <rect x="204" y="300" width="94" height="26" rx="13" fill="#1b2844" stroke="#2f4068"/><text x="251" y="318" text-anchor="middle">WebSocket</text>
+    <rect x="306" y="300" width="56" height="26" rx="13" fill="#1b2844" stroke="#2f4068"/><text x="334" y="318" text-anchor="middle">chDB</text>
+    <rect x="370" y="300" width="50" height="26" rx="13" fill="#1b2844" stroke="#2f4068"/><text x="395" y="318" text-anchor="middle">MCP</text>
+    <rect x="428" y="300" width="66" height="26" rx="13" fill="#1b2844" stroke="#2f4068"/><text x="461" y="318" text-anchor="middle">live UI</text>
+  </g>
+
+  <!-- tools -> proxy -> chDB -->
+  <g class="mono">
+    <rect x="690" y="52" width="166" height="34" rx="8" class="box"/><text x="706" y="74" class="src">run42<tspan class="dim">.</tspan>curl</text>
+    <rect x="690" y="98" width="166" height="34" rx="8" class="box"/><text x="706" y="120" class="src">run42<tspan class="dim">.</tspan>nuclei</text>
+    <rect x="690" y="144" width="166" height="34" rx="8" class="box"/><text x="706" y="166" class="src">run7<tspan class="dim">.</tspan>browser</text>
+
+    <path d="M856 69 C 880 69, 880 115, 904 115" class="wire" marker-end="url(#head)"/>
+    <path d="M856 115 L 904 115" class="wire" marker-end="url(#head)"/>
+    <path d="M856 161 C 880 161, 880 115, 904 115" class="wire" marker-end="url(#head)"/>
+
+    <rect x="908" y="62" width="150" height="106" rx="12" fill="#1a2a4a" stroke="#6ea0ff" stroke-width="1.5"/>
+    <text x="983" y="104" text-anchor="middle" font-size="15" fill="#ffffff" font-weight="600">mitmproxy</text>
+    <text x="983" y="126" text-anchor="middle" class="lbl">+ m2c recorder</text>
+    <text x="983" y="148" text-anchor="middle" class="lbl" fill="#6ea0ff">who sent it?</text>
+
+    <path d="M1058 115 L 1112 115" class="wire" marker-end="url(#head)"/>
+
+    <!-- database cylinder -->
+    <path d="M1118 76 v78 a46 14 0 0 0 92 0 v-78" fill="#1a2a4a" stroke="#9b7bff" stroke-width="1.5"/>
+    <ellipse cx="1164" cy="76" rx="46" ry="14" fill="#22325a" stroke="#9b7bff" stroke-width="1.5"/>
+    <path d="M1118 102 a46 14 0 0 0 92 0" fill="none" stroke="#9b7bff" stroke-width="1" opacity="0.5"/>
+    <path d="M1118 128 a46 14 0 0 0 92 0" fill="none" stroke="#9b7bff" stroke-width="1" opacity="0.5"/>
+    <text x="1164" y="124" text-anchor="middle" font-size="16" fill="#ffffff" font-weight="600">chDB</text>
+
+    <circle r="4" class="pkt"><animateMotion dur="2.4s" repeatCount="indefinite" path="M856 69 C 880 69, 880 115, 904 115 L 1058 115 L 1112 115"/></circle>
+    <circle r="4" class="pkt"><animateMotion dur="2.4s" begin="0.8s" repeatCount="indefinite" path="M856 115 L 904 115 L 1058 115 L 1112 115"/></circle>
+    <circle r="4" class="pkt" fill="#9b7bff"><animateMotion dur="2.4s" begin="1.6s" repeatCount="indefinite" path="M856 161 C 880 161, 880 115, 904 115 L 1058 115 L 1112 115"/></circle>
+  </g>
+
+  <!-- live tail -->
+  <g class="mono">
+    <rect x="690" y="206" width="526" height="120" rx="10" fill="#0d1526" stroke="#26365a"/>
+    <circle cx="708" cy="222" r="4" fill="#ff8787" opacity="0.8"/><circle cx="722" cy="222" r="4" fill="#fcc419" opacity="0.8"/><circle cx="736" cy="222" r="4" fill="#69db7c" opacity="0.8"/>
+    <text x="754" y="226" class="lbl">$ m2c tail</text>
+    <text y="254" class="row"><tspan x="706" class="dim">1041</tspan><tspan x="752">run42/curl</tspan><tspan x="872">GET</tspan><tspan x="920" class="ok">200</tspan><tspan x="960">api.acme.test/v1/users</tspan></text>
+    <text y="276" class="row"><tspan x="706" class="dim">1042</tspan><tspan x="752">run42/nuclei</tspan><tspan x="872">POST</tspan><tspan x="920" class="bad">500</tspan><tspan x="960">api.acme.test/login</tspan></text>
+    <text y="298" class="row"><tspan x="706" class="dim">1043</tspan><tspan x="752">run7/browser</tspan><tspan x="872">GET</tspan><tspan x="920" class="ok">200</tspan><tspan x="960">app.acme.test/events</tspan><tspan x="1150" class="tag">sse</tspan></text>
+    <text y="320" class="row"><tspan x="706" class="dim">1044</tspan><tspan x="752">run42/ffuf</tspan><tspan x="872">GET</tspan><tspan x="920" class="warn">404</tspan><tspan x="960">api.acme.test/.git/config</tspan></text>
+  </g>
+</svg>

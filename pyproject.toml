@@ -1,0 +1,32 @@
+[project]
+name = "m2c"
+version = "0.1.0"
+description = "mitmproxy2chDB: record every flow through mitmproxy into an embedded chDB (ClickHouse) database, attributed per agent session and tool"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [{ name = "Filip Nyquist", email = "fnyquist@pm.me" }]
+dependencies = [
+    "mitmproxy>=12.2,<13",
+    "chdb>=4.4",
+    # decode.py uses these directly; mitmproxy 12.3 swapped zstandard for backports.zstd
+    "brotli>=1.0",
+    "zstandard>=0.22",
+]
+
+[project.scripts]
+m2c = "m2c.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "hypothesis>=6"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/m2c"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: runs a real mitmdump and chDB"]

@@ -1,0 +1,7 @@
+.venv
+dist
+.git
+.pytest_cache
+**/__pycache__
+.playwright-mcp
+m2c-data
