@@ -141,7 +141,7 @@ def offline_stub(monkeypatch):
     class FakeOffline:
         online = False
 
-        def __init__(self, data):
+        def __init__(self, data, proto_file=None):
             made.append(data)
 
     monkeypatch.setattr(client, "Offline", FakeOffline)
@@ -185,7 +185,7 @@ def test_reachable_api_is_used(tmp_path, offline_stub):
 
 
 def test_unreachable_api_and_locked_directory_says_both(tmp_path, monkeypatch):
-    def locked(data):
+    def locked(data, proto_file=None):
         raise client.ClientError(f"{data} is in use by a running proxy")
 
     monkeypatch.setattr(client, "Offline", locked)

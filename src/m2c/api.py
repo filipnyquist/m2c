@@ -150,7 +150,7 @@ class Api:
                 (r"/v1/flows", FlowsHandler, {"api": self}),
                 (r"/v1/flows/(\d+)", FlowHandler, {"api": self}),
                 (r"/v1/flows/(\d+)/body/(req|resp)", BodyHandler, {"api": self}),
-                (r"/v1/flows/(\d+)/(sse|ws)", ChildrenHandler, {"api": self}),
+                (r"/v1/flows/(\d+)/(sse|ws|grpc)", ChildrenHandler, {"api": self}),
                 (r"/v1/flows/(\d+)/curl", CurlHandler, {"api": self}),
                 (r"/v1/flows/(\d+)/live", FlowLiveHandler, {"api": self}),
                 (r"/v1/tail", TailHandler, {"api": self}),
@@ -248,7 +248,7 @@ class Base(tornado.web.RequestHandler):
         except PermissionError as e:
             self.set_header("WWW-Authenticate", 'Bearer realm="m2c"')
             raise tornado.web.HTTPError(401, str(e)) from None
-        self.q = Queries(self.api._run, self.scope)
+        self.q = Queries(self.api._run, self.scope, self.api.st.config.proto_file)
 
     def write_error(self, status_code, **kwargs):
         exc = kwargs.get("exc_info", (None, None, None))[1]
@@ -358,8 +358,14 @@ class BodyHandler(Base):
 
 class ChildrenHandler(Base):
     async def get(self, n, kind):
+        args = [self.flow_n(n), self.int_arg("after", 0, hi=(1 << 32) - 1), self.int_arg("limit", 1000)]
+        if kind == "grpc":
+            # decoding is CPU work: the heavy lane, so it never slows lists down
+            args.append(self.get_argument("decode", "1") != "0")
+            self.send_json(await self.call(self.q.grpc, *args, heavy=True))
+            return
         fn = self.q.sse if kind == "sse" else self.q.ws
-        self.send_json(await self.call(fn, self.flow_n(n), self.int_arg("after", 0, hi=(1 << 32) - 1), self.int_arg("limit", 1000)))
+        self.send_json(await self.call(fn, *args))
 
 
 class CurlHandler(Base):
@@ -601,7 +607,23 @@ class TailHandler(SseStream):
             await self.flush()
 
 
-def _child_json(kind: str, row: dict) -> dict:
+def _child_json(kind: str, row: dict, proto_file: str | None = None) -> dict:
+    if kind == "grpc":
+        keys = ("seq", "dir_seq", "ts", "ms_since_req", "from_client", "service", "method", "compressed", "encoding", "size",
+                "truncated", "partial")
+        out = {k: row.get(k) for k in keys}
+        out["preview"] = bool(row.get("_preview"))
+        data = row.get("data") or b""
+        out["stored"] = len(data)
+        out["base64"] = base64.b64encode(data).decode()
+        complete = not out["truncated"] and not out["partial"] and not out["compressed"]
+        out["decoded"], out["decoded_as"] = "", "" if complete else "incomplete"
+        if complete:
+            from . import grpc
+
+            path = f"/{row.get('service')}/{row.get('method')}" if row.get("service") else ""
+            out["decoded"], out["decoded_as"] = grpc.decode(data, path, bool(row.get("from_client")), proto_file)
+        return out
     if kind == "sse":
         keys = ("seq", "ts", "ms_since_req", "event", "id", "retry_ms", "data", "size", "truncated", "partial")
         out = {k: row.get(k) for k in keys}
@@ -645,7 +667,7 @@ class FlowLiveHandler(SseStream):
             self.send_event("open", item)
             last_seq = 0
             for kind, row in list(live.children.get(n, ())):
-                self.send_event(kind, _child_json(kind, row))
+                self.send_event(kind, _child_json(kind, row, self.api.st.config.proto_file))
                 last_seq = row.get("seq") or last_seq
             await self.flush()
             while not self.gone:
@@ -658,7 +680,7 @@ class FlowLiveHandler(SseStream):
                     await self.flush()
                     continue
                 for kind, row in items:
-                    self.send_event(kind, _child_json(kind, row))
+                    self.send_event(kind, _child_json(kind, row, self.api.st.config.proto_file))
                     last_seq = row.get("seq") or last_seq
                 if lost:
                     self.send_event("lost", {"count": lost, "after": last_seq})

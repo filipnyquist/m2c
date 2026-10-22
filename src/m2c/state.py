@@ -61,6 +61,9 @@ class Config:
     push_on_exit: str = ""
     fsync: bool = False
     labels: dict = field(default_factory=dict)
+    grpc_msg_cap: int = 256 * 1024
+    grpc_max_messages: int = 100_000
+    proto_file: str = ""
 
 
 @dataclass
@@ -83,6 +86,10 @@ class FlowState:
     tag: str = ""
     ws_seq: int = 0
     sse_seq: int = 0
+    grpc_seq: int = 0  # both directions
+    grpc_req: int = 0
+    grpc_resp: int = 0
+    grpc_web_trailers: list = field(default_factory=list)
     recorded: bool = False  # its http_flows row is queued: later SSE events (teardown at shutdown) are not kept
     extra: dict = field(default_factory=dict)
 
@@ -129,6 +136,7 @@ class State:
         self.conns: dict[str, ConnState] = {}
         self.flows: dict[str, FlowState] = {}  # flow.id -> every flow that has an n and no row yet
         self.live_ws: dict[str, http.HTTPFlow] = {}
+        self.tunnels: dict[str, dict] = {}  # TCP flows mitmproxy forwards without parsing (not HTTP)
         self.live = LiveFeed(config.ring_size)
         self.api = None
         self.closed = False

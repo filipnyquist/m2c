@@ -11,6 +11,7 @@ import logging
 from collections.abc import Callable
 
 from .decode import DecodeError, StreamDecoder, codings
+from .grpc import Framer, FramingError
 from .sse import SseParser
 
 log = logging.getLogger("m2c.tee")
@@ -134,6 +135,48 @@ class SseTee(BodyTee):
                 log.exception("m2c: SSE parser failed at the end of the stream")
                 if self.on_error is not None:
                     self.on_error()
+
+
+class GrpcTee(BodyTee):
+    """BodyTee that also splits a gRPC body into messages as they stream (for per-message rows and the live view).
+    A framing error stops the splitting; raw capture and counting go on."""
+
+    def __init__(self, cap: int, framer: Framer, inner=None, on_error=None):
+        super().__init__(cap, inner, on_error)
+        self.framer = framer
+        self.framing = True
+        self.closed = False
+        self.frame_error: str | None = None
+
+    def observe(self, chunk: bytes) -> None:
+        super().observe(chunk)
+        if chunk and self.framing:
+            try:
+                self.framer.feed(chunk)
+            except FramingError as e:
+                self.stop_framing(f"not gRPC framing: {e}")
+            except Exception:  # noqa: BLE001 - a framer or sink bug must not cost the raw body
+                self.stop_framing("framer failed")
+                log.exception("m2c: gRPC framing failed; messages of this stream are no longer recorded")
+                if self.on_error is not None:
+                    self.on_error()
+
+    def stop_framing(self, why: str) -> None:
+        if self.frame_error is None:
+            self.frame_error = why
+        self.framing = False
+
+    def finish(self) -> None:
+        self.close_framer()
+
+    def close_framer(self) -> None:
+        if not self.closed:
+            self.closed = True
+            if self.framing:
+                try:
+                    self.framer.close()
+                except Exception:  # noqa: BLE001
+                    log.exception("m2c: gRPC framing failed at the end of the stream")
 
 
 def wants_tee(headers, method: str = "", status: int = 0, threshold: int = 1 << 20, is_request: bool = False) -> bool:

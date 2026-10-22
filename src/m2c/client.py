@@ -85,6 +85,9 @@ class Online:
     def ws(self, n, after=0, limit=1000):
         return self._json(f"/v1/flows/{int(n)}/ws", {"after": after, "limit": limit})
 
+    def grpc(self, n, after=0, limit=1000, decode=True):
+        return self._json(f"/v1/flows/{int(n)}/grpc", {"after": after, "limit": limit, "decode": "1" if decode else "0"})
+
     def curl(self, n):
         try:
             with self._req(f"/v1/flows/{int(n)}/curl") as res:
@@ -129,7 +132,7 @@ class Offline:
 
     online = False
 
-    def __init__(self, data: Path):
+    def __init__(self, data: Path, proto_file: str | None = None):
         from .db import open_session
         from .queries import Queries
 
@@ -141,7 +144,7 @@ class Offline:
             if "lock" in str(e).lower() or "already running" in str(e).lower():
                 raise ClientError(f"{data} is in use by a running proxy, but its API was not found (is m2c_api_listen off?)") from None
             raise
-        self.q = Queries(lambda sql, params, fmt: sess.query(sql, fmt, params=params).bytes())
+        self.q = Queries(lambda sql, params, fmt: sess.query(sql, fmt, params=params).bytes(), proto_file=proto_file)
 
     def __getattr__(self, name):
         return getattr(self.q, name)
@@ -165,12 +168,12 @@ def _alive(pid: int) -> bool:
     return True
 
 
-def connect(data: Path, api: str | None = None, token: str | None = None, offline: bool = False):
+def connect(data: Path, api: str | None = None, token: str | None = None, offline: bool = False, proto_file: str | None = None):
     """The live API when one is reachable (explicit, or found in <data>/api.json), else the data directory."""
     api = api or os.environ.get("M2C_API")
     token = token or os.environ.get("M2C_API_TOKEN")
     if offline:
-        return Offline(data)
+        return Offline(data, proto_file)
     info = data / "api.json"
     try:
         meta = json.loads(info.read_text()) if info.exists() else {}
@@ -191,7 +194,7 @@ def connect(data: Path, api: str | None = None, token: str | None = None, offlin
         # A proxy killed without cleaning up (SIGKILL, OOM, a container crash where the next `m2c` is pid 1 again):
         # read the directory, which still refuses if a live process holds it.
         try:
-            return Offline(data)
+            return Offline(data, proto_file)
         except ClientError as e:
             raise ClientError(f"cannot reach the API at {online.url} (from {info}), and {e}") from None
-    return Offline(data)
+    return Offline(data, proto_file)

@@ -21,13 +21,15 @@ import secrets
 SUMMARY_KEYS = (
     "n", "ts", "session", "tool", "call_id", "tag", "method", "scheme", "host", "port", "path", "url", "status",
     "duration_ms", "req_body_size", "resp_body_size", "resp_content_type", "resp_capture", "sse_event_count",
-    "ws_message_count", "error", "error_kind", "ua_tool",
+    "ws_message_count", "error", "error_kind", "ua_tool", "grpc", "grpc_service", "grpc_method", "grpc_status",
 )
-TEXT_KEYS = ("session", "tool", "call_id", "tag", "error", "error_kind", "ua_tool")
+TEXT_KEYS = ("session", "tool", "call_id", "tag", "error", "error_kind", "ua_tool", "grpc_service", "grpc_method")
 
 
 def summary(row: dict) -> dict:
     out = {k: row.get(k, "" if k in TEXT_KEYS else 0) for k in SUMMARY_KEYS}
+    out["grpc"] = bool(row.get("grpc"))
+    out["grpc_status"] = row.get("grpc_status", -1)
     out["ts"] = row.get("ts_start", 0)
     for side in ("req", "resp"):
         if not out[f"{side}_body_size"]:
@@ -47,7 +49,7 @@ CHILDREN_BYTES = 32 << 20  # all open flows together; past it a flow keeps fewer
 
 
 def _preview(kind: str, row: dict) -> dict:
-    key = "data" if kind == "sse" else "content"
+    key = "content" if kind == "ws" else "data"
     value = row.get(key)
     if value is None or len(value) <= PREVIEW_BYTES:
         return row

@@ -12,7 +12,9 @@ import shlex
 from collections.abc import Callable
 from datetime import datetime, timezone
 
+from . import grpc
 from .filters import compile_filter
+from .schema import FAILED
 
 Run = Callable[[str, dict | None, str], bytes]
 
@@ -20,7 +22,7 @@ DB = "m2c"
 SUMMARY = (
     "n, toUnixTimestamp64Milli(ts_start) AS ts, session, tool, call_id, tag, method, scheme, host, port, path, status, "
     "duration_ms, req_body_size, resp_body_size, resp_content_type, resp_capture, sse_event_count, ws_message_count, "
-    "error, error_kind, ua_tool"
+    "error, error_kind, ua_tool, grpc, grpc_service, grpc_method, grpc_status"
 )
 DETAIL = (
     "n, toString(flow_id) AS flow_id, scan_id, toUnixTimestamp64Milli(ts_start) AS ts, toUnixTimestamp64Milli(ts_end) AS ts_end, "
@@ -29,7 +31,9 @@ DETAIL = (
     "method, scheme, host, port, path, url, http_version, req_headers, req_trailers, req_body_size, req_body_truncated, "
     "req_body_decoded, req_capture, length(req_body) AS req_body_stored, status, reason, resp_headers, resp_trailers, "
     "resp_content_type, resp_body_size, resp_body_truncated, resp_body_decoded, resp_capture, length(resp_body) AS resp_body_stored, "
-    "sse_event_count, ws_message_count, ws_close_code, ws_close_reason, ws_closed_by_client, error, error_kind, end_reason, is_replay"
+    "sse_event_count, ws_message_count, ws_close_code, ws_close_reason, ws_closed_by_client, error, error_kind, end_reason, is_replay, "
+    "grpc, grpc_service, grpc_method, grpc_status, grpc_message, grpc_status_source, grpc_timeout_ms, grpc_encoding, "
+    "grpc_req_messages, grpc_resp_messages"
 )
 HOP_BY_HOP = {"proxy-authorization", "proxy-connection", "connection", "keep-alive", "transfer-encoding", "content-length", "te", "upgrade"}
 
@@ -47,9 +51,10 @@ def _headers(pairs) -> list[list[str]]:
 
 
 class Queries:
-    def __init__(self, run: Run, scope: str | None = None):
+    def __init__(self, run: Run, scope: str | None = None, proto_file: str | None = None):
         self._run = run
         self.scope = scope
+        self.proto_file = proto_file or None  # names protobuf fields when gRPC messages are decoded
 
     def rows(self, sql: str, params: dict | None = None) -> list[dict]:
         return _rows(self._run(sql, params, "JSONEachRow"))
@@ -63,7 +68,7 @@ class Queries:
         where, params = self._where(q)
         return self.rows(
             f"SELECT session, tool, toUnixTimestamp64Milli(min(ts_start)) AS first_seen, toUnixTimestamp64Milli(max(ts_end)) AS last_seen, "
-            f"count() AS flows, countIf(status >= 400 OR error != '') AS failures, uniqExact(host) AS hosts, "
+            f"count() AS flows, countIf{FAILED} AS failures, uniqExact(host) AS hosts, "
             f"sum(req_body_size) AS bytes_up, sum(resp_body_size) AS bytes_down, sum(ws_message_count) AS ws_messages, "
             f"sum(sse_event_count) AS sse_events FROM {DB}.http_flows WHERE {where} GROUP BY session, tool ORDER BY last_seen DESC",
             params,
@@ -118,6 +123,7 @@ class Queries:
         row = rows[0]
         for key in ("req_headers", "req_trailers", "resp_headers", "resp_trailers"):
             row[key] = _headers(row[key])
+        row["grpc_status_name"] = grpc.status_name(row["grpc_status"]) if row.get("grpc") else ""
         return row
 
     def body(self, n: int, side: str, max_bytes: int | None = None) -> tuple[bytes, str] | None:
@@ -167,6 +173,22 @@ class Queries:
         )
         return rows
 
+    def grpc(self, n: int, after: int = 0, limit: int = 1000, decode: bool = True) -> list[dict]:
+        """The messages of one gRPC call in order (both directions), each decoded as protobuf when it is complete:
+        with field names when a .proto file defines the method's types, schemaless otherwise."""
+        rows = self._children(
+            "grpc_messages", n, after, limit,
+            "seq, dir_seq, toUnixTimestamp64Milli(ts) AS ts, ms_since_req, from_client, service, method, compressed, encoding, "
+            "decompressed, size, truncated, partial, length(data) AS stored, base64Encode(data) AS base64",
+        )
+        for r in rows:
+            complete = not r["truncated"] and not r["partial"] and (not r["compressed"] or r["decompressed"])
+            r["decoded"], r["decoded_as"] = "", "" if complete else "incomplete"
+            if decode and complete:
+                path = f"/{r['service']}/{r['method']}" if r["service"] else ""
+                r["decoded"], r["decoded_as"] = grpc.decode(base64.b64decode(r["base64"]), path, r["from_client"], self.proto_file)
+        return rows
+
     # ------------------------------------------------------------------ scan
 
     def stats(self) -> dict:
@@ -177,7 +199,7 @@ class Queries:
             f"toUnixTimestamp64Milli(max(ts_end)) AS last_ts, any(scan_id) AS scan_id FROM {DB}.http_flows WHERE {where}",
             params,
         )[0]
-        for table in ("sse_events", "ws_messages"):
+        for table in ("sse_events", "ws_messages", "grpc_messages"):
             out[table] = int(self.rows(f"SELECT count() AS c FROM {DB}.{table} WHERE {where}", params)[0]["c"])
         if self.scope is None:
             out["proxy_events"] = {

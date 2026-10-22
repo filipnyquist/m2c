@@ -95,10 +95,11 @@ runs, never for the harness process itself. `m2c doctor` warns when the current 
 
 | Table | One row per |
 |---|---|
-| `http_flows` | HTTP flow: identity, timings, TLS (SNI, version, ALPN), method/URL, headers and trailers in wire order, bodies (decoded, capped at 1 MiB, full size kept), status, error and error kind, SSE/WebSocket summary |
+| `http_flows` | HTTP flow: identity, timings, TLS (SNI, version, ALPN), method/URL, headers and trailers in wire order, bodies (decoded, capped at 1 MiB, full size kept), status, error and error kind, SSE/WebSocket summary, gRPC service, method, status and message counts |
 | `sse_events` | SSE event of a streamed response, written as it arrives (`ms_since_req` of the first event is the time to first token) |
 | `ws_messages` | WebSocket message, either direction, text or binary |
-| `proxy_events` | `auth_challenge`, `auth_rejected`, `connect_error` (a CONNECT whose upstream could not be reached), `tls_failed_client` (a client that doesn't trust the CA or pins certificates), `tls_failed_server`, `sse_parse_stopped` (SSE parsing of a flow stopped early; the reason is in `message`), `health` counters, `started`/`stopped` |
+| `grpc_messages` | gRPC message, either direction, in call order: size, compression, the message bytes (decompressed) |
+| `proxy_events` | `auth_challenge`, `auth_rejected`, `connect_error` (a CONNECT whose upstream could not be reached), `tls_failed_client` (a client that doesn't trust the CA or pins certificates), `tls_failed_server`, `sse_parse_stopped` (SSE parsing of a flow stopped early; the reason is in `message`), `tcp_tunnel` (a tunnel that isn't HTTP: who, where, bytes each way; see gRPC below), `grpc_framing_stopped`, `health` counters, `started`/`stopped` |
 
 **Streaming stays streaming.**
 - SSE, ndjson, gRPC, chunked bodies and bodies over 1 MiB pass straight through.
@@ -106,6 +107,43 @@ runs, never for the harness process itself. `m2c doctor` warns when the current 
 - A failure in that code never breaks the client's connection.
 
 **WebSocket messages are not kept in memory.** Long sockets stay flat.
+
+### gRPC
+
+gRPC over TLS goes through the proxy like any HTTPS client:
+- **Pointing clients at the proxy:** set `grpc_proxy` or `https_proxy`, or the `grpc.http_proxy` channel option, with the credentials in the URL.
+- **Trusting the proxy's CA:** gRPC ignores `SSL_CERT_FILE`, so `m2c env` also sets `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH`.
+
+Every call is one `http_flows` row with `grpc = true`.
+- **Service and method:** `grpc_service` and `grpc_method`.
+- **Status:**
+  - `grpc_status` and `grpc_message` come from the trailers, from a trailers-only response or from a gRPC-Web trailer frame.
+  - Without any of those, the status is inferred from how the call ended: a client cancel at its `grpc-timeout` is DEADLINE_EXCEEDED.
+  - `grpc_status_source` says which, and `-1` means no status.
+  - A call that didn't end OK counts as a failure in `sessions`, `has:error` and the UI, even though its HTTP status is 200.
+- **Messages:** each message in either direction is a `grpc_messages` row, written as it streams.
+  - The `seq` numbering keeps the order of a bidirectional call.
+  - Compressed messages (`grpc-encoding` gzip, deflate or zstd) are decompressed.
+  - Each message keeps up to `m2c_grpc_msg_cap` (256 KiB) and its full size.
+- **Decoding:** protobuf is decoded when you read a call, with mitmproxy's decoder, not while recording.
+  - Fields are numbered unless the proxy has a `.proto` file: `m2c proxy --proto api.proto`, or `m2c grpc N --proto api.proto`.
+  - Recording never pays for decoding, and a `.proto` added later applies to old scans too.
+
+**Variants:** gRPC-Web (binary and `-text`) is split the same way. The Connect protocol is recorded as plain
+streamed bodies.
+
+**Plaintext gRPC (h2c) is not recorded as calls.** mitmproxy forwards plaintext HTTP/2 inside a tunnel as raw TCP.
+m2c records such a tunnel as a `tcp_tunnel` event with a warning (`reason = h2c`), so it shows up, but its calls
+don't. Use TLS for traffic you want recorded.
+
+### HTTP/3
+
+HTTP/3 runs over QUIC, which is UDP. An HTTP or SOCKS5 proxy carries only TCP, and mitmproxy supports neither SOCKS5
+UDP nor CONNECT-UDP, so clients that use m2c as their proxy speak HTTP/1.1 or HTTP/2 and are recorded completely.
+HTTP/3 only appears when a client bypasses the proxy, the same gap as any tool that ignores its proxy settings.
+
+Capturing it would need a mode that intercepts UDP, such as one WireGuard listener per session. That isn't
+built yet.
 
 **Rows go to chDB in batches** (1000 rows, 8 MiB or 250 ms) from one writer thread. The hooks only queue rows,
 so a slow insert never delays traffic.
@@ -129,7 +167,8 @@ Used by the CLI, the API (`q=`), MCP and the UI:
 
 ```
 session:run42 tool:nuclei|ffuf call:c7 host:*.example.com method:POST status:5xx|404|>=400 path:/api/*
-ct:json ua:curl has:sse|ws|error|body err:timeout after:10m before:2026-10-21T12:00 n:100-200
+ct:json ua:curl has:sse|ws|grpc|error|body err:timeout after:10m before:2026-10-21T12:00 n:100-200
+grpc:demo.v1.Demo/* gstatus:!0|INVALID_ARGUMENT|14
 body:"needle" -status:404 "free text in the URL"
 ```
 
@@ -144,6 +183,7 @@ body:"needle" -status:404 "free text in the URL"
 | `m2c show N [--body\|--req-body] [--max B]` | one flow; `--body` writes the raw response body to stdout |
 | `m2c sessions [query]` | per session and tool: flows, failures, hosts, bytes |
 | `m2c sse N`, `m2c ws N` | SSE events or WebSocket messages of a flow |
+| `m2c grpc N [--proto F]` | the messages of a gRPC call, decoded from protobuf |
 | `m2c curl N` | a curl command that replays the request. The body goes in `--data-raw` (or through stdin when binary) and the URL isn't globbed, so replaying a captured payload never reads local files. |
 | `m2c har [query] > out.har` | HAR export |
 | `m2c events [--kind auth_rejected]` | proxy events |
@@ -167,7 +207,7 @@ The API listens on `m2c_api_listen`, `127.0.0.1:8124` by default. Requests need 
 | `GET /v1/flows?q=&limit=&cursor=&order=` | summaries, newest first, with a `next` cursor |
 | `GET /v1/flows/N` | full detail (`pending: true` while a flow is still being written) |
 | `GET /v1/flows/N/body/req\|resp?max=` | the body bytes. Always sent as `application/octet-stream` with a sandbox CSP; the original type is in `X-M2C-Content-Type`. |
-| `GET /v1/flows/N/sse`, `/ws` | events or messages, paged with `after=` |
+| `GET /v1/flows/N/sse`, `/ws`, `/grpc` | events or messages, paged with `after=`; gRPC messages decoded (`decode=0` for raw only) |
 | `GET /v1/flows/N/curl`, `GET /v1/har?q=` | replay command, HAR export |
 | `GET /v1/tail?q=&backlog=` | **SSE stream:** `open` when a long-lived flow starts, `flow` when any flow ends, `stats` every 2 s |
 | `GET /v1/flows/N/live` | **SSE stream:** the SSE events or WebSocket messages of an open flow as they happen, then `end` |
@@ -205,7 +245,7 @@ The sessions can't write, change settings or read local files with `file()`/`url
 **Tools:**
 - `traffic_stats`, `traffic_sessions`, `traffic_search`
 - `traffic_get`: bodies are cut at `max_bytes`, 8 KiB by default
-- `traffic_sse`, `traffic_ws`, `traffic_curl`
+- `traffic_sse`, `traffic_ws`, `traffic_grpc` (decoded gRPC messages), `traffic_curl`
 - `traffic_sql`: admin token only
 
 An agent given its own `<session>:<token>` can inspect its own traffic and nothing else.
@@ -299,6 +339,8 @@ to see the mitmdump command. Commonly used options:
 | `m2c_ui` | `true` |
 | `m2c_push_on_exit` | — |
 | `m2c_labels` | — |
+| `m2c_grpc_msg_cap`, `m2c_grpc_max_messages` | 256 KiB, 100 000 per call |
+| `m2c_proto_file` | — (`m2c proxy --proto`) |
 
 ## Limits
 
@@ -307,7 +349,8 @@ to see the mitmdump command. Commonly used options:
 - WebSocket ping and pong frames are not visible.
 - zstd-encoded SSE streams are stored raw and not parsed into events.
 - SSE event parsing stops after a content-decoding error, or when one network chunk decodes to more than 1 MiB, so a compression bomb can't stall the proxy. The raw body is still stored and counted, and a `sse_parse_stopped` row records why.
-- Raw TCP, UDP and DNS are not recorded.
+- HTTP/3 (QUIC) isn't recorded; clients going through the proxy use HTTP/1.1 or HTTP/2 (see HTTP/3 above).
+- Tunnels that aren't HTTP (plaintext HTTP/2, SSH, TLS that isn't intercepted) are only counted, as `tcp_tunnel` events. UDP and DNS are not recorded.
 - Nothing may `fork()` inside the proxy process after chDB has loaded.
 
 ## Development

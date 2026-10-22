@@ -18,7 +18,7 @@ dependencies = [
 m2c = "m2c.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "hypothesis>=6"]
+dev = ["pytest>=8", "hypothesis>=6", "grpcio>=1.60"]
 
 [build-system]
 requires = ["hatchling"]

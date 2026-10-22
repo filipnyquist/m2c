@@ -132,14 +132,26 @@ HTTP_FLOWS = Table(
         C("error_kind", LC),
         C("end_reason", END_REASON),
         C("is_replay", "Bool"),
+        # gRPC calls (application/grpc*): status from trailers, a trailers-only response, a gRPC-Web trailer frame,
+        # or inferred from how the call ended. grpc_status is -1 when there is none.
+        C("grpc", "Bool"),
+        C("grpc_service", LC),
+        C("grpc_method", LC),
+        C("grpc_status", "Int16"),
+        C("grpc_message", "String"),
+        C("grpc_status_source", LC),
+        C("grpc_timeout_ms", "UInt32"),
+        C("grpc_encoding", LC),
+        C("grpc_req_messages", "UInt32"),
+        C("grpc_resp_messages", "UInt32"),
     ),
     order_by="session, ts_start, flow_id",
     # Flow lists are "newest first, maybe filtered": the summary columns sorted by n answer the second step of
     # Queries.flows (n IN (...)) with a primary-key lookup. Small: no bodies or headers.
     projections=(
-        "by_n (SELECT n, ts_start, ts_end, session, tool, call_id, tag, method, scheme, host, port, path, url, status, "
+        "by_n_v2 (SELECT n, ts_start, ts_end, session, tool, call_id, tag, method, scheme, host, port, path, url, status, "
         "duration_ms, req_body_size, resp_body_size, resp_content_type, resp_capture, sse_event_count, ws_message_count, "
-        "error, error_kind, ua_tool ORDER BY n)",
+        "error, error_kind, ua_tool, grpc, grpc_service, grpc_method, grpc_status ORDER BY n)",
     ),
     indexes=(
         "idx_host host TYPE bloom_filter(0.01) GRANULARITY 4",
@@ -197,6 +209,34 @@ SSE_EVENTS = Table(
     settings=BIG_BLOCKS,
 )
 
+GRPC_MESSAGES = Table(
+    "grpc_messages",
+    (
+        C("scan_id", LC),
+        C("flow_id", "UUID"),
+        C("n", "UInt64"),
+        C("seq", "UInt32"),  # one counter for both directions: the order of a bidi call
+        C("dir_seq", "UInt32"),
+        C("ts", TS, TS_CODEC),
+        C("ms_since_req", "UInt32"),
+        *IDENTITY,
+        C("host", LC),
+        C("service", LC),
+        C("method", LC),
+        C("from_client", "Bool"),
+        C("compressed", "Bool"),
+        C("encoding", LC),
+        C("decompressed", "Bool"),
+        C("size", "UInt32"),  # as the length prefix declares it
+        C("truncated", "Bool"),
+        C("partial", "Bool"),
+        C("data", "String", BIG),  # the message without its prefix, decompressed when possible
+    ),
+    order_by="session, flow_id, seq",
+    indexes=("idx_n n TYPE minmax GRANULARITY 1",),
+    settings=BIG_BLOCKS,
+)
+
 PROXY_EVENTS = Table(
     "proxy_events",
     (
@@ -222,14 +262,21 @@ PROXY_EVENTS = Table(
     order_by="kind, ts",
 )
 
-TABLES = {t.name: t for t in (HTTP_FLOWS, WS_MESSAGES, SSE_EVENTS, PROXY_EVENTS)}
+TABLES = {t.name: t for t in (HTTP_FLOWS, WS_MESSAGES, SSE_EVENTS, GRPC_MESSAGES, PROXY_EVENTS)}
 
-SESSION_SUMMARY = f"""CREATE VIEW IF NOT EXISTS {DB}.session_summary AS
+# A failed flow: an HTTP error, a transport error, or a gRPC call that did not end OK.
+FAILED = "(status >= 400 OR error != '' OR (grpc AND grpc_status > 0))"
+
+SESSION_SUMMARY = f"""CREATE OR REPLACE VIEW {DB}.session_summary AS
 SELECT session, tool, min(ts_start) AS first_seen, max(ts_end) AS last_seen, count() AS flows,
-       countIf(status >= 400 OR error != '') AS failures, uniqExact(host) AS hosts,
+       countIf{FAILED} AS failures, uniqExact(host) AS hosts,
        sum(req_body_size) AS bytes_up, sum(resp_body_size) AS bytes_down,
        sum(ws_message_count) AS ws_messages, sum(sse_event_count) AS sse_events
 FROM {DB}.http_flows GROUP BY session, tool"""
+
+
+# Projections replaced by a newer definition (a projection cannot be altered in place).
+RETIRED_PROJECTIONS = {"http_flows": ("by_n",)}
 
 
 def statements(db: str = DB) -> list[str]:
@@ -243,6 +290,8 @@ def statements(db: str = DB) -> list[str]:
             )
         for p in t.projections:
             out.append(f"ALTER TABLE {db}.{t.name} ADD PROJECTION IF NOT EXISTS {p}")
+        for old in RETIRED_PROJECTIONS.get(t.name, ()):
+            out.append(f"ALTER TABLE {db}.{t.name} DROP PROJECTION IF EXISTS {old}")
         # The writer replays spool files with their id as insert_deduplication_token: a replay after a crash is a no-op.
         out.append(f"ALTER TABLE {db}.{t.name} MODIFY SETTING non_replicated_deduplication_window = 10000")
     out.append(SESSION_SUMMARY.replace(f"{DB}.", f"{db}."))

@@ -19,11 +19,11 @@ from pathlib import Path
 from mitmproxy import ctx, exceptions, http
 from mitmproxy.proxy import mode_specs
 
-from . import db, live, rows, state
+from . import db, grpc, live, rows, state
 from .identity import HEADER_CALL, HEADER_TAG, HEADER_TOOL, MODES, SESSION, TOOL, AuthError, Identity, clean_tag, override
 from .sse import SseParser
 from .state import Config, ConnState, FlowState
-from .tee import BodyTee, SseTee, wants_tee
+from .tee import BodyTee, GrpcTee, SseTee, wants_tee
 
 log = logging.getLogger("m2c")
 
@@ -57,6 +57,9 @@ OPTIONS: dict[str, tuple[type, object, str]] = {
     "m2c_ring_size": (int, 10_000, "Flow summaries kept in memory for the live tail"),
     "m2c_push_on_exit": (str, "", "Push the scan to this central ClickHouse URL at shutdown (password: M2C_PUSH_PASSWORD)"),
     "m2c_labels": (str, "", "key=value,key=value labels for the central scans row"),
+    "m2c_grpc_msg_cap": (int, 256 * 1024, "Bytes stored per gRPC message (the declared size is always recorded)"),
+    "m2c_grpc_max_messages": (int, 100_000, "gRPC messages stored per call (counting continues)"),
+    "m2c_proto_file": (str, "", "A .proto file used to name fields when gRPC messages are read (API, UI, MCP)"),
 }
 
 
@@ -233,6 +236,9 @@ class Recorder:
             push_on_exit=opts.m2c_push_on_exit,
             fsync=opts.m2c_fsync,
             labels=parse_labels(opts.m2c_labels),
+            grpc_msg_cap=opts.m2c_grpc_msg_cap,
+            grpc_max_messages=opts.m2c_grpc_max_messages,
+            proto_file=str(Path(opts.m2c_proto_file).expanduser().resolve()) if opts.m2c_proto_file else "",
         )
         try:
             state.init(config)
@@ -262,6 +268,8 @@ class Recorder:
                 self._finish_ws(st, flow, "proxy_shutdown")
             for fs in list(st.flows.values()):
                 self._record(st, fs.flow, end_reason="proxy_shutdown")
+            for flow_id in list(st.tunnels):
+                self._finish_tunnel(st, flow_id, "proxy_shutdown")
         except Exception:  # noqa: BLE001
             st.writer.counters.hook_errors += 1
             log.exception("m2c: recording the open flows at shutdown failed")
@@ -389,7 +397,17 @@ class Recorder:
         st.flows[flow.id] = fs
         flow.metadata["m2c"] = _meta(ident, fs.n, tag)
         req = flow.request
-        h2_body = req.http_version.startswith("HTTP/2") and "content-length" not in headers and req.method not in ("GET", "HEAD", "OPTIONS")
+        gkind = grpc.kind(headers.get("content-type"))
+        if gkind:
+            # gRPC: always streamed, and split into messages on the way (both directions)
+            fs.extra["grpc"] = gkind
+            framer = grpc.Framer(self._grpc_sink(st, flow, fs, True), st.config.grpc_msg_cap, text=gkind == "grpc-web-text")
+            tee = GrpcTee(st.config.body_cap, framer, inner=req.stream, on_error=self._tee_error)
+            req.stream = tee
+            fs.extra["req_tee"] = tee
+            return
+        unsized = req.http_version.startswith(("HTTP/2", "HTTP/3")) and "content-length" not in headers
+        h2_body = unsized and req.method not in ("GET", "HEAD", "OPTIONS")
         if h2_body or wants_tee(headers, req.method, threshold=st.config.stream_threshold, is_request=True):
             tee = BodyTee(st.config.body_cap, inner=req.stream, on_error=self._tee_error)
             req.stream = tee
@@ -411,7 +429,12 @@ class Recorder:
         if not (res.stream or wants_tee(res.headers, flow.request.method, res.status_code, st.config.stream_threshold)):
             return
         ctype = (res.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
-        if ctype == "text/event-stream":
+        gkind = grpc.kind(ctype) or fs.extra.get("grpc")
+        if gkind:
+            fs.extra["grpc"] = fs.extra.get("grpc") or gkind
+            framer = grpc.Framer(self._grpc_sink(st, flow, fs, False), st.config.grpc_msg_cap, text=gkind == "grpc-web-text")
+            tee = GrpcTee(st.config.body_cap, framer, inner=res.stream, on_error=self._tee_error)
+        elif ctype == "text/event-stream":
             parser = SseParser(self._sse_sink(st, flow, fs), st.config.sse_event_cap)
             tee = SseTee(st.config.body_cap, parser, res.headers.get("content-encoding"), inner=res.stream, on_error=self._tee_error)
         else:
@@ -422,9 +445,98 @@ class Recorder:
 
     @staticmethod
     def _publish_open(st, flow: http.HTTPFlow, fs: FlowState, capture: str) -> None:
-        item = live.summary(rows.http_row(flow, fs.ident, st.config.scan_id, fs.n, fs.tag))
+        row = rows.http_row(flow, fs.ident, st.config.scan_id, fs.n, fs.tag)
+        if fs.extra.get("grpc"):
+            service, method = grpc.service_method(flow.request.path)
+            row.update(grpc=True, grpc_service=service, grpc_method=method)
+        item = live.summary(row)
         item.update(resp_capture=capture, duration_ms=0, resp_body_size=0)
         st.live.publish_open(item)
+
+    @staticmethod
+    def _grpc_sink(st, flow: http.HTTPFlow, fs: FlowState, from_client: bool):
+        started = flow.request.timestamp_start
+        host = flow.request.pretty_host
+        service, method = grpc.service_method(flow.request.path)
+        message = flow.request if from_client else flow.response
+        encoding = (message.headers.get("grpc-encoding") or "identity").lower()[:40] if message is not None else ""
+        cap = st.config.grpc_max_messages
+
+        def sink(msg: grpc.Message):
+            if fs.recorded:
+                return
+            if msg.trailer:  # gRPC-Web carries the trailers as a last, flagged frame
+                fs.grpc_web_trailers = grpc.parse_trailer_block(msg.data)
+                return
+            fs.grpc_seq += 1
+            if from_client:
+                fs.grpc_req += 1
+            else:
+                fs.grpc_resp += 1
+            if fs.grpc_seq > cap:
+                return
+            now = time.time()
+            row = {
+                "scan_id": st.config.scan_id,
+                "flow_id": flow.id,
+                "n": fs.n,
+                "seq": fs.grpc_seq,
+                "dir_seq": fs.grpc_req if from_client else fs.grpc_resp,
+                "ts": rows.ms(now),
+                "ms_since_req": max(0, rows.ms(now) - rows.ms(started)),
+                "session": fs.ident.session,
+                "tool": fs.ident.tool,
+                "call_id": fs.ident.call,
+                "host": host,
+                "service": service,
+                "method": method,
+                "from_client": from_client,
+                "compressed": msg.compressed,
+                "encoding": encoding if msg.compressed else "identity",
+                "size": msg.size,
+                "truncated": msg.truncated,
+                "partial": msg.partial,
+                "data": msg.data,
+            }
+            st.live.publish_child(fs.n, "grpc", row)
+            st.writer.put("grpc_messages", row)
+
+        return sink
+
+    @staticmethod
+    def _grpc_fields(st, flow: http.HTTPFlow, fs: FlowState, row: dict) -> dict:
+        """The gRPC columns of a finished (or abandoned) call. Closes the framers first, so a message cut short
+        still gets its row."""
+        for key in ("req_tee", "resp_tee"):
+            tee = fs.extra.get(key)
+            if isinstance(tee, GrpcTee):
+                tee.close_framer()
+                if tee.frame_error:
+                    st.event("grpc_framing_stopped", "warn", session=fs.ident.session, tool=fs.ident.tool, host=flow.request.host,
+                             port=flow.request.port, flow_id=flow.id, message=f"{key[:-4]}: {tee.frame_error}")
+        req, res = flow.request, flow.response
+        service, method = grpc.service_method(req.path)
+        timeout = grpc.timeout_ms(req.headers.get("grpc-timeout"))
+        status = grpc.status_of(
+            res.trailers.fields if res is not None and res.trailers else (),
+            res.headers.fields if res is not None else (),
+            fs.grpc_web_trailers,
+            row.get("error_kind", ""),
+            timeout,
+            row.get("duration_ms", 0),
+        )
+        return {
+            "grpc": True,
+            "grpc_service": service,
+            "grpc_method": method,
+            "grpc_status": status.code,
+            "grpc_message": status.message,
+            "grpc_status_source": status.source,
+            "grpc_timeout_ms": timeout,
+            "grpc_encoding": (req.headers.get("grpc-encoding") or (res.headers.get("grpc-encoding") if res is not None else "") or "")[:40],
+            "grpc_req_messages": fs.grpc_req,
+            "grpc_resp_messages": fs.grpc_resp,
+        }
 
     @staticmethod
     def _sse_sink(st, flow: http.HTTPFlow, fs: FlowState):
@@ -475,6 +587,9 @@ class Recorder:
             for side in ("req", "resp"):
                 if f"_{side}_raw" in row and row[f"_{side}_raw"] is None:
                     row[f"{side}_capture"] = "none"
+        row.update(extra)  # end_reason/ws fields first: the gRPC status inference reads the final error_kind/duration
+        if fs.extra.get("grpc"):
+            row.update(self._grpc_fields(st, flow, fs, row))
         req_tee = fs.extra.get("req_tee")
         if req_tee is not None:
             row.update(_req_raw=req_tee.captured, req_body_size=req_tee.size, req_body_truncated=req_tee.truncated, req_capture="streamed")
@@ -493,6 +608,7 @@ class Recorder:
                 resp_capture="sse" if isinstance(resp_tee, SseTee) else "streamed",
                 sse_event_count=fs.sse_seq,
             )
+        fs.recorded = True  # after the tees are closed: their last event or message still counts
         row.update(extra)
         st.live.publish(live.summary(row))
         st.writer.put("http_flows", row)
@@ -569,6 +685,85 @@ class Recorder:
         st = state.get()
         if st is not None:
             self._finish_ws(st, flow, "ws_closed")
+
+    # ----------------------------------------------------------------- tunnels that are not HTTP
+
+    @guard
+    def tcp_start(self, flow):
+        st = state.get()
+        if st is None:
+            return
+        cs = st.conns.get(flow.client_conn.id)
+        st.tunnels[flow.id] = {"flow": flow, "ident": cs.ident if cs is not None else None, "start": time.time(),
+                               "up": 0, "down": 0, "first_up": b"", "first_down": b""}
+
+    @guard
+    def tcp_message(self, flow):
+        st = state.get()
+        t = st.tunnels.get(flow.id) if st is not None else None
+        if t is None or not flow.messages:
+            return
+        msg = flow.messages[-1]
+        side = "up" if msg.from_client else "down"
+        t[side] += len(msg.content)
+        if len(t["first_" + side]) < 64:
+            t["first_" + side] += msg.content[: 64 - len(t["first_" + side])]
+        if st.config.ws_trim and len(flow.messages) > 1:
+            del flow.messages[:-1]  # long tunnels would otherwise keep every chunk in memory
+
+    @guard
+    def tcp_end(self, flow):
+        st = state.get()
+        if st is not None:
+            self._finish_tunnel(st, flow.id, "closed")
+
+    @guard
+    def tcp_error(self, flow):
+        st = state.get()
+        if st is not None:
+            self._finish_tunnel(st, flow.id, "error")
+
+    @staticmethod
+    def _finish_tunnel(st, flow_id: str, how: str) -> None:
+        """One proxy_events row per TCP tunnel mitmproxy forwarded as raw bytes: who, where, how much. Plaintext
+        HTTP/2 (gRPC without TLS) lands here too, because mitmproxy does not parse it; that gets a warning."""
+        t = st.tunnels.pop(flow_id, None)
+        if t is None:
+            return
+        flow, ident = t["flow"], t["ident"]
+        up, down = t["first_up"], t["first_down"]
+        if up.startswith(b"PRI * HTTP/2.0"):
+            looks, severity = "h2c", "warn"
+        elif up[:1] == b"\x16" and up[1:2] == b"\x03":
+            looks, severity = "tls", "info"
+        elif up.startswith(b"SSH-") or down.startswith(b"SSH-"):
+            looks, severity = "ssh", "info"
+        else:
+            looks, severity = "unknown", "info"
+        address = flow.server_conn.address if flow.server_conn and flow.server_conn.address else ("", 0)
+        note = {
+            "h2c": "plaintext HTTP/2 (for example gRPC without TLS): mitmproxy forwards it unparsed, so its requests are not "
+                   "recorded as flows; use TLS",
+        }.get(looks, f"{looks} tunnel, not HTTP: forwarded and counted, not parsed")
+        if flow.error:
+            note += f"; error: {flow.error.msg}"
+        st.event(
+            "tcp_tunnel",
+            severity,
+            session=ident.session if ident else "",
+            tool=ident.tool if ident else "",
+            proxy_user=ident.user if ident else "",
+            reason=looks,
+            listener=flow.client_conn.proxy_mode.full_spec if flow.client_conn.proxy_mode else "",
+            client_conn_id=flow.client_conn.id,
+            client_ip=flow.client_conn.peername[0] if flow.client_conn.peername else "",
+            host=str(address[0]),
+            port=int(address[1] or 0),
+            flow_id=flow.id,
+            message=note,
+            counters={"bytes_up": t["up"], "bytes_down": t["down"],
+                      "duration_ms": max(0, int((time.time() - t["start"]) * 1000)), "closed": int(how == "closed")},
+        )
 
     @guard
     def tls_failed_client(self, data):

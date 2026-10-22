@@ -1,8 +1,8 @@
 """The filter language shared by the CLI, the API (`q=`), MCP and the web UI, compiled to parameterized SQL.
 
     session:abc tool:nuclei call:c7 tag:x host:*.acme.test method:POST|PUT status:5xx|404 status:>=400
-    path:/api/* ct:json ua:curl has:sse|ws|error|body err:timeout after:10m before:2026-10-21T12:00 n:100-200
-    body:"needle" -status:404 "free text"
+    path:/api/* ct:json ua:curl has:sse|ws|grpc|error|body err:timeout after:10m before:2026-10-21T12:00 n:100-200
+    grpc:demo.v1.Demo/* gstatus:!0|INVALID_ARGUMENT|14 body:"needle" -status:404 "free text"
 
 Terms are ANDed; `|` ORs values inside one term; a leading `-` negates a term. Free text matches the URL.
 Values never reach the SQL text: every one becomes a `{pN:Type}` parameter.
@@ -22,11 +22,26 @@ N_RANGE = re.compile(r"^([0-9]{1,20})(?:-([0-9]{1,20}))?$")  # ASCII digits: "²
 U64_MAX = (1 << 64) - 1
 I64_MAX = (1 << 63) - 1
 UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-KEYS = {"session", "tool", "call", "tag", "host", "method", "status", "path", "url", "ct", "ua", "has", "err", "after", "before", "n", "body", "source"}
+KEYS = {"session", "tool", "call", "tag", "host", "method", "status", "path", "url", "ct", "ua", "has", "err", "after", "before", "n", "body",
+        "source", "grpc", "gstatus"}
 
 
 class FilterError(ValueError):
     pass
+
+
+def _grpc_code(value: str) -> int | None:
+    """A gRPC status by number or name ('3', 'INVALID_ARGUMENT', 'invalid_argument'); None for 'ok'/'err' forms."""
+    from .grpc import CODES
+
+    if value.isdigit() and value.isascii():
+        code = int(value)
+        if code > 255:
+            raise FilterError(f"bad gRPC status {value!r}")
+        return code
+    if value.upper() in CODES:
+        return CODES[value.upper()]
+    raise FilterError(f"gstatus: takes a code (3), a name (INVALID_ARGUMENT), !0 or none")
 
 
 class Compiler:
@@ -114,7 +129,8 @@ def _term(c: Compiler, key: str, value: str) -> str:
         conds = {
             "sse": "resp_capture = 'sse'",
             "ws": "resp_capture = 'websocket'",
-            "error": "(error != '' OR status >= 500)",
+            "error": "(error != '' OR status >= 500 OR (grpc AND grpc_status > 0))",
+            "grpc": "grpc",
             "body": "(req_body_size > 0 OR resp_body_size > 0)",
             "reqbody": "req_body_size > 0",
             "truncated": "(req_body_truncated OR resp_body_truncated)",
@@ -136,6 +152,15 @@ def _term(c: Compiler, key: str, value: str) -> str:
     if key == "body":
         needle = c.p(value)
         return f"(position(req_body, {needle}) > 0 OR position(resp_body, {needle}) > 0)"
+    if key == "grpc":
+        target = value if "/" in value else (value + "/*" if value else "*")
+        return f"(grpc AND " + _glob(c, "concat(grpc_service, '/', grpc_method)", target) + ")"
+    if key == "gstatus":
+        if value in ("!0", "err", "error"):
+            return "(grpc AND grpc_status > 0)"
+        if value == "none":
+            return "(grpc AND grpc_status = -1)"
+        return f"(grpc AND grpc_status = {c.p(_grpc_code(value), 'Int16')})"
     raise FilterError(f"unknown filter {key}:")
 
 
@@ -213,7 +238,8 @@ def _py_term(key: str, value: str):
         preds = {
             "sse": lambda s: s.get("resp_capture") == "sse",
             "ws": lambda s: s.get("resp_capture") == "websocket",
-            "error": lambda s: bool(s.get("error")) or s.get("status", 0) >= 500,
+            "error": lambda s: bool(s.get("error")) or s.get("status", 0) >= 500 or (bool(s.get("grpc")) and s.get("grpc_status", -1) > 0),
+            "grpc": lambda s: bool(s.get("grpc")),
             "body": lambda s: s.get("req_body_size", 0) > 0 or s.get("resp_body_size", 0) > 0,
             "reqbody": lambda s: s.get("req_body_size", 0) > 0,
         }
@@ -230,6 +256,16 @@ def _py_term(key: str, value: str):
     if key == "n":
         lo_i, hi_i = _n_range(value)
         return lambda s: lo_i <= s.get("n", 0) <= hi_i
+    if key == "grpc":
+        rx = _glob_re(value if "/" in value else (value + "/*" if value else "*"))
+        return lambda s: bool(s.get("grpc")) and bool(rx.match(f"{s.get('grpc_service', '')}/{s.get('grpc_method', '')}"))
+    if key == "gstatus":
+        if value in ("!0", "err", "error"):
+            return lambda s: bool(s.get("grpc")) and s.get("grpc_status", -1) > 0
+        if value == "none":
+            return lambda s: bool(s.get("grpc")) and s.get("grpc_status", -1) == -1
+        code = _grpc_code(value)
+        return lambda s: bool(s.get("grpc")) and s.get("grpc_status", -1) == code
     return None  # body:, source:, has:truncated need the database
 
 

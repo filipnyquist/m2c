@@ -36,12 +36,14 @@ CENTRAL_ORDER = {
     "http_flows": ("toYYYYMM(ts_start)", "scan_id, session, ts_start, n"),
     "ws_messages": ("toYYYYMM(ts)", "scan_id, session, n, seq"),
     "sse_events": ("toYYYYMM(ts)", "scan_id, session, n, seq"),
+    "grpc_messages": ("toYYYYMM(ts)", "scan_id, session, n, seq"),
     "proxy_events": ("toYYYYMM(ts)", "scan_id, kind, ts"),
 }
 # What identifies a row, for the anti-join when a chunk is partly there already.
 KEYS = {
     "http_flows": "flow_id",
     "sse_events": "flow_id, seq",
+    "grpc_messages": "flow_id, seq",
     "ws_messages": "flow_id, seq",
     "proxy_events": "ts, kind, session, tool, proxy_user, client_conn_id, reason, host, message",
 }
@@ -49,6 +51,7 @@ KEYS = {
 SIZES = {
     "http_flows": "length(req_body) + length(resp_body) + 2048",
     "sse_events": "length(data) + 256",
+    "grpc_messages": "length(data) + 256",
     "ws_messages": "length(content) + 256",
 }
 # ClickHouse errors that no retry fixes: bad SQL, unknown table/database/user, authentication, access.
@@ -417,7 +420,8 @@ class Pusher:
         ended = self._local(
             "SELECT greatest(" + ", ".join(
                 f"(SELECT toUnixTimestamp64Milli(max({col})) FROM {schema.DB}.{table})"
-                for table, col in (("http_flows", "ts_end"), ("proxy_events", "ts"), ("ws_messages", "ts"), ("sse_events", "ts"))
+                for table, col in (("http_flows", "ts_end"), ("proxy_events", "ts"), ("ws_messages", "ts"), ("sse_events", "ts"),
+                                   ("grpc_messages", "ts"))
             ) + ") AS ts"
         )[0]
         try:
@@ -461,7 +465,7 @@ class Pusher:
             self._scans_row(meta, local, "pushing")
             ids = ", ".join(_q(s) for s in meta["scan_ids"])
             left = dict.fromkeys(local, 0)
-            for table in ("http_flows", "sse_events", "ws_messages"):
+            for table in ("http_flows", "sse_events", "ws_messages", "grpc_messages"):
                 for where, label in self._chunks(table):
                     sent, gap, note = self._push_range(table, ids, where, f"{meta['scan_id']}:{table}:{label}")
                     left[table] += gap

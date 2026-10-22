@@ -72,6 +72,8 @@ def cmd_proxy(args) -> None:
         argv += ["--set", f"m2c_scan_id={args.scan_id}"]
     if args.push_on_exit:
         argv += ["--set", f"m2c_push_on_exit={args.push_on_exit}"]
+    if args.proto:
+        argv += ["--set", f"m2c_proto_file={Path(args.proto).expanduser().resolve()}"]
     if args.label:
         argv += ["--set", "m2c_labels=" + json.dumps(_labels(args.label))]  # JSON: values may hold ',' and '='
     if not args.verify_upstream:
@@ -173,6 +175,7 @@ def proxy_env(args) -> dict[str, str]:
         env.update(
             NODE_EXTRA_CA_CERTS=str(ca_cert(_confdir(args))),
             SSL_CERT_FILE=str(bundle),
+            GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=str(bundle),  # gRPC's own TLS ignores SSL_CERT_FILE
             REQUESTS_CA_BUNDLE=str(bundle),
             CURL_CA_BUNDLE=str(bundle),
             GIT_SSL_CAINFO=str(bundle),
@@ -238,7 +241,8 @@ def _client(args):
     from .client import ClientError, connect
 
     try:
-        client = connect(_data(args), getattr(args, "api", None), getattr(args, "token", None), getattr(args, "offline", False))
+        client = connect(_data(args), getattr(args, "api", None), getattr(args, "token", None), getattr(args, "offline", False),
+                         getattr(args, "proto", None))
     except ClientError as e:
         sys.exit(f"m2c: {e}")
     if not client.online:
@@ -370,14 +374,23 @@ def cmd_show(args) -> None:
         print(f"  websocket: {flow['ws_message_count']} messages, closed {flow['ws_close_code']} {flow['ws_close_reason']} by {'client' if flow['ws_closed_by_client'] else 'server'}  (m2c ws {flow['n']})")
     if flow["resp_capture"] == "sse":
         print(f"  sse: {flow['sse_event_count']} events  (m2c sse {flow['n']})")
+    if flow.get("grpc"):
+        code = flow["grpc_status"]
+        status = "no status" if code == -1 else f"{flow.get('grpc_status_name') or code} ({code}, from {flow['grpc_status_source']})"
+        print(f"  grpc: {flow['grpc_service']}/{flow['grpc_method']}  {status}" + (f": {flow['grpc_message']}" if flow["grpc_message"] else "")
+              + f"   {flow['grpc_req_messages']} > / {flow['grpc_resp_messages']} <  (m2c grpc {flow['n']})")
     print()
     _print_headers("> request headers", flow["req_headers"])
+    if flow.get("req_trailers"):
+        _print_headers("> request trailers", flow["req_trailers"])
     if flow["req_body_stored"]:
         body = _run_client(lambda: c.body(args.n, "req", args.max))
         print(f"> request body ({_size(flow['req_body_size'])} on the wire{', truncated' if flow['req_body_truncated'] else ''})")
         print(_preview(body[0] if body else b"", args.max))
     print()
     _print_headers("< response headers", flow["resp_headers"])
+    if flow.get("resp_trailers"):
+        _print_headers("< response trailers", flow["resp_trailers"])
     if flow["resp_body_stored"]:
         body = _run_client(lambda: c.body(args.n, "resp", args.max))
         print(f"< response body ({_size(flow['resp_body_size'])} on the wire{', decoded' if flow['resp_body_decoded'] else ''}{', truncated' if flow['resp_body_truncated'] else ''})")
@@ -414,6 +427,33 @@ def cmd_children(args) -> None:
             arrow = ">" if r["from_client"] else "<"
             text = r["text"] if r["text"] else f"<{r['size']} bytes {r['opcode']}>"
             print(f"{r['seq']:>5} {_when(r['ts'])} {arrow} {text}")
+
+
+def cmd_grpc(args) -> None:
+    c = _client(args)
+    local = bool(args.proto) and c.online  # the proxy decodes with its own .proto; with --proto, decode here
+    rows = _run_client(lambda: c.grpc(args.n, args.after, args.limit, decode=not local and not args.raw))
+    if local and not args.raw:
+        import base64
+
+        from . import grpc
+
+        for r in rows:
+            if r.get("decoded_as") != "incomplete":
+                path = f"/{r['service']}/{r['method']}" if r["service"] else ""
+                r["decoded"], r["decoded_as"] = grpc.decode(base64.b64decode(r["base64"]), path, r["from_client"], args.proto)
+    for r in rows:
+        if args.json:
+            _out_json(r)
+            continue
+        arrow = ">" if r["from_client"] else "<"
+        notes = [n for n, on in (("compressed", r["compressed"] and not r.get("decompressed", True)), ("truncated", r["truncated"]),
+                                 ("partial", r["partial"])) if on]
+        print(f"{r['seq']:>5} +{r['ms_since_req']}ms {arrow} #{r['dir_seq']} {_size(r['size'])}" + (f"  ({', '.join(notes)})" if notes else ""))
+        if r.get("decoded"):
+            print("\n".join("      " + line for line in r["decoded"].rstrip("\n").splitlines()))
+        elif r.get("base64"):
+            print(f"      base64 {r['base64'][:120]}" + ("…" if len(r["base64"]) > 120 else ""))
 
 
 def cmd_curl(args) -> None:
@@ -674,6 +714,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--api", default=os.environ.get("M2C_API_LISTEN", "127.0.0.1:8124"), help="API/MCP/UI address; empty to turn it off")
     sp.add_argument("--no-ui", action="store_true", help="don't serve the web UI")
     sp.add_argument("--push-on-exit", default=os.environ.get("M2C_PUSH_ON_EXIT", ""), help="central ClickHouse URL to push to at shutdown")
+    sp.add_argument("--proto", default=os.environ.get("M2C_PROTO_FILE", ""), help="a .proto file naming gRPC message fields in the API, UI and MCP")
     sp.add_argument("--label", action="append", help="key=value for the central scans row (repeatable)")
     sp.add_argument("--verify-upstream", action="store_true", help="verify upstream TLS certificates (default: don't)")
     sp.add_argument("--verbose", action="store_true", help="mitmproxy's normal flow output")
@@ -739,6 +780,12 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("n", type=int)
         sp.add_argument("--after", type=int, default=0)
         sp.add_argument("--limit", type=int, default=1000)
+    sp = reader("grpc", "the messages of one gRPC call, decoded from protobuf", cmd_grpc)
+    sp.add_argument("n", type=int)
+    sp.add_argument("--after", type=int, default=0)
+    sp.add_argument("--limit", type=int, default=1000)
+    sp.add_argument("--proto", help="a .proto file for field names (default: the proxy's m2c_proto_file, else field numbers)")
+    sp.add_argument("--raw", action="store_true", help="don't decode; show the bytes (base64)")
     sp = reader("curl", "a curl command replaying one request", cmd_curl)
     sp.add_argument("n", type=int)
     sp = reader("har", "HAR export of matching flows", cmd_har)

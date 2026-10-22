@@ -14,6 +14,12 @@ M0–M7 are implemented. 79 tests cover them: unit tests, plus integration tests
 - - **Review:** an adversarial review across five areas confirmed 52 issues (one more was refuted), among them one critical (non-ASCII proxy passwords bypassed auth). All are fixed, 215 tests.
 - **Writer:** goes through a write-ahead spool and `INSERT … SELECT FROM file()`, because chDB's streaming insert can report success and store nothing at the memory limit. `memory_worker_use_cgroup=0`, because chDB otherwise counts the whole desktop cgroup as its own memory.
 - **Connections:** `connection_strategy=eager` (lazy broke HTTP/2 uploads without Content-Length).
+- **gRPC (2026-10-22):**
+  - Calls get status, service and method columns.
+  - Each message is a `grpc_messages` row, decompressed and decoded from protobuf at read time (schemaless, or with a `.proto`).
+  - gRPC errors count as failures.
+  - Tunnels that aren't HTTP are `tcp_tunnel` events (plaintext gRPC gets a warning).
+- **HTTP/3:** investigated and not built. Proxy clients never use it; capturing it needs UDP interception, with WireGuard listeners per session as the candidate design.
 - **Not built:** Codex and Playwright example files (the README covers them), and the `CLAUDE_CODE_SHELL_PREFIX` per-command tool naming.
 
 A general-purpose recording proxy for **any AI agent or harness**: Claude Code, Codex, custom agents, LangChain apps, browser agents. It is not tied to one product.

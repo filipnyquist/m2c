@@ -86,7 +86,7 @@ img.preview { max-width: 100%; border: 1px solid var(--line); border-radius: 6px
     <aside id="sessions"></aside>
     <section id="list">
       <table>
-        <thead><tr><th style="width:46px">#</th><th style="width:96px">time</th><th style="width:140px">session / tool</th><th style="width:54px">method</th><th style="width:44px">status</th><th>url</th><th style="width:54px">size</th><th style="width:48px">ms</th></tr></thead>
+        <thead><tr><th style="width:46px">#</th><th style="width:96px">time</th><th style="width:140px">session / tool</th><th style="width:54px">method</th><th style="width:64px">status</th><th>url</th><th style="width:54px">size</th><th style="width:48px">ms</th></tr></thead>
         <tbody id="rows"></tbody>
       </table>
       <button class="btn" id="more" hidden>Load older</button>
@@ -159,7 +159,12 @@ $("#tok").onkeydown = (e) => { if (e.key === "Enter") $("#go").click(); };
 
 const fmtSize = (n) => { n = +n || 0; if (n < 1024) return n + "B"; for (const u of ["K", "M", "G"]) { n /= 1024; if (n < 1024 || u === "G") return n.toFixed(1) + u; } };
 const fmtTime = (ms) => { if (!ms) return "-"; const d = new Date(ms); return d.toLocaleTimeString([], { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0"); };
-const statusClass = (f) => f.status ? "s" + String(f.status)[0] : (f.error ? "serr" : "");
+const GRPC_STATUS = ["OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED", "NOT_FOUND", "ALREADY_EXISTS", "PERMISSION_DENIED",
+  "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION", "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL", "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED"];
+const grpcFailed = (f) => f.grpc && f.grpc_status > 0;
+const statusClass = (f) => grpcFailed(f) ? "s5" : f.status ? "s" + String(f.status)[0] : (f.error ? "serr" : "");
+const statusText = (f) => grpcFailed(f) ? `${f.status || "ERR"}·g${f.grpc_status}` : (f.status || (f.error ? "ERR" : "-"));
+const statusTitle = (f) => grpcFailed(f) ? `gRPC ${GRPC_STATUS[f.grpc_status] || f.grpc_status}` + (f.error ? `; ${f.error}` : "") : (f.error || "");
 
 function rowFor(f, isNew) {
   const who = el("td", { title: `${f.session} / ${f.tool}${f.call_id ? " #" + f.call_id : ""}` }, `${f.session} / ${f.tool}`);
@@ -167,9 +172,10 @@ function rowFor(f, isNew) {
   const url = el("td", { title: f.url || (f.host + f.path) }, f.host + f.path);
   if (f.resp_capture === "sse") url.prepend(el("span", { class: "tag", text: "sse" }), " ");
   if (f.resp_capture === "websocket") url.prepend(el("span", { class: "tag", text: "ws" }), " ");
+  if (f.grpc) url.prepend(el("span", { class: "tag", text: "grpc" }), " ");
   const tr = el("tr", { class: "row" + (isNew ? " new" : "") + (f.open ? " open" : ""), onclick: () => select(f.n) },
     el("td", { text: f.n }), el("td", { text: fmtTime(f.ts) }), who, el("td", { text: f.method }),
-    el("td", { class: f.open ? "s3" : statusClass(f), text: f.open ? "…" : (f.status || (f.error ? "ERR" : "-")), title: f.open ? "still streaming" : (f.error || "") }), url,
+    el("td", { class: f.open ? "s3" : statusClass(f), text: f.open ? "…" : statusText(f), title: f.open ? "still streaming" : statusTitle(f) }), url,
     el("td", { text: fmtSize(f.resp_body_size) }), el("td", { text: f.duration_ms }));
   tr.dataset.n = f.n;
   if (state.selected === f.n) tr.classList.add("sel");
@@ -361,12 +367,19 @@ async function select(n) {
   const tabs = [["resp", "Response"], ["req", "Request"]];
   if (flow.resp_capture === "sse") tabs.push(["sse", `SSE (${flow.sse_event_count})`]);
   if (flow.resp_capture === "websocket") tabs.push(["ws", `WebSocket (${flow.ws_message_count})`]);
+  if (flow.grpc) tabs.push(["grpc", `gRPC (${flow.grpc_req_messages + flow.grpc_resp_messages})`]);
   tabs.push(["curl", "curl"]);
   if (!tabs.some(([k]) => k === state.tab)) state.tab = "resp";
   const content = el("div");
   const tabBar = el("div", { class: "tabs" }, ...tabs.map(([k, label]) => el("button", { class: "btn" + (k === state.tab ? " on" : ""), onclick: () => { state.tab = k; select(n); } }, label)));
   const head = [el("div", { class: "title", text: `#${flow.n}  ${flow.method} ${flow.url}` }), meta];
   if (flow.error) head.push(el("div", { class: "s5", text: `error (${flow.error_kind}): ${flow.error}` }));
+  if (flow.grpc) {
+    const ok = flow.grpc_status === 0, none = flow.grpc_status === -1;
+    head.push(el("div", { class: ok ? "s2" : none ? "s3" : "s5", text: `gRPC ${flow.grpc_service}/${flow.grpc_method} · ` +
+      (none ? "no status" : `${flow.grpc_status_name} (${flow.grpc_status})${flow.grpc_status_source === "inferred" ? ", inferred" : ""}`) +
+      (flow.grpc_message ? `: ${flow.grpc_message}` : "") }));
+  }
   box.replaceChildren(...head, tabBar, content);
   try {
     if (state.tab === "resp") content.append(...headersBlock("Response headers", flow.resp_headers), ...headersBlock("Trailers", flow.resp_trailers.length ? flow.resp_trailers : null), ...(await bodyBlock(n, "resp", flow)));
@@ -380,8 +393,19 @@ async function select(n) {
         content.append(el("div", { class: "ev " + (m.from_client ? "client" : "server") }, el("span", { class: "at", text: fmtTime(m.ts) }), el("span", { class: "dir", text: m.from_client ? "→ " : "← " }), m.text || `<${m.size} bytes ${m.opcode}> ${m.base64.slice(0, 120)}`));
       content.append(el("div", { class: "note", text: `closed ${flow.ws_close_code} ${flow.ws_close_reason} by ${flow.ws_closed_by_client ? "client" : "server"}` }));
     }
+    if (state.tab === "grpc") {
+      for (const m of await json(`/v1/flows/${n}/grpc?limit=2000`)) content.append(grpcNode(m));
+    }
     if (state.tab === "curl") content.append(el("pre", { text: await (await api(`/v1/flows/${n}/curl`)).text() }));
   } catch (e) { content.append(el("div", { class: "s5", text: e.message })); }
+}
+
+function grpcNode(m) {
+  const notes = [m.compressed && !m.decompressed && m.decoded_as === "incomplete" ? "compressed" : "", m.truncated ? "truncated" : "", m.partial ? "partial" : "", m.preview ? "preview" : ""].filter(Boolean);
+  const head = el("div", {}, el("span", { class: "at", text: `+${m.ms_since_req}ms` }), el("span", { class: "dir", text: m.from_client ? "→ " : "← " }),
+    `#${m.dir_seq} · ${fmtSize(m.size)}` + (notes.length ? ` · ${notes.join(", ")}` : "") + (m.decoded_as && m.decoded_as !== "proto" && m.decoded_as !== "incomplete" ? ` · ${m.decoded_as}` : ""));
+  const body = m.decoded ? el("pre", { text: m.decoded }) : el("pre", { text: m.base64 ? `base64 ${m.base64.slice(0, 600)}${m.base64.length > 600 ? "…" : ""}` : "(empty)" });
+  return el("div", { class: "ev " + (m.from_client ? "client" : "server") }, head, body);
 }
 
 async function liveDetail(n, f) {
@@ -392,12 +416,12 @@ async function liveDetail(n, f) {
   box.replaceChildren(
     el("div", { class: "title", text: `#${f.n}  ${f.method} ${f.url}` }),
     el("div", { class: "meta" }, el("span", { class: "s3", text: `streaming ${f.resp_capture}` }), el("span", { text: `${f.session} / ${f.tool}${f.call_id ? " #" + f.call_id : ""}` }), el("span", { text: fmtTime(f.ts) }), count),
-    el("h3", { text: f.resp_capture === "websocket" ? "WebSocket messages (live)" : f.resp_capture === "sse" ? "SSE events (live)" : "Body is streaming; details when it ends" }),
+    el("h3", { text: f.resp_capture === "websocket" ? "WebSocket messages (live)" : f.resp_capture === "sse" ? "SSE events (live)" : f.grpc ? "gRPC messages (live)" : "Body is streaming; details when it ends" }),
     list);
   const ctl = new AbortController();
   state.flowLive = ctl;
   const seen = new Map();
-  const render = (kind, item) => kind === "sse"
+  const render = (kind, item) => kind === "grpc" ? grpcNode(item) : kind === "sse"
     ? el("div", { class: "ev" }, el("span", { class: "at", text: `+${item.ms_since_req}ms` }), item.event ? el("span", { class: "tag", text: item.event }) : null, " ", item.data + (item.partial ? "  (partial)" : ""))
     : el("div", { class: "ev " + (item.from_client ? "client" : "server") }, el("span", { class: "at", text: fmtTime(item.ts) }), el("span", { class: "dir", text: item.from_client ? "→ " : "← " }), item.text || `<${item.size} bytes ${item.opcode}> ${item.base64.slice(0, 120)}`);
   const add = (kind, item) => {
@@ -412,7 +436,7 @@ async function liveDetail(n, f) {
     list.insertBefore(node, later || null);
     count.textContent = `${seen.size} so far`;
   };
-  const child = f.resp_capture === "websocket" ? "ws" : f.resp_capture === "sse" ? "sse" : null;
+  const child = f.resp_capture === "websocket" ? "ws" : f.resp_capture === "sse" ? "sse" : f.grpc ? "grpc" : null;
   // Subscribe first, then backfill what was already written, so nothing falls between the two.
   let backfilled = false;
   const backfill = () => {
@@ -423,7 +447,7 @@ async function liveDetail(n, f) {
   try {
     await readSse(`/v1/flows/${n}/live`, ctl.signal, (kind, item) => {
       if (kind === "open") { backfill(); return; }
-      if (kind === "sse" || kind === "ws") {
+      if (kind === "sse" || kind === "ws" || kind === "grpc") {
         add(kind, item);
       } else if (kind === "lost") {
         // This view fell behind: fetch the gap once the writer has stored it (the final view loads at the end anyway).

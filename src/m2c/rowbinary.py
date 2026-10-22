@@ -19,6 +19,7 @@ _i64 = struct.Struct("<q").pack
 _u64 = struct.Struct("<Q").pack
 _u32 = struct.Struct("<I").pack
 _u16 = struct.Struct("<H").pack
+_i16 = struct.Struct("<h").pack
 _ZERO_UUID = b"\x00" * 16
 _ZERO_IP = b"\x00" * 16
 
@@ -128,6 +129,8 @@ def type_encoder(type_: str) -> Callable:
         return _clamp(_u64, 2**64 - 1)
     if base == "UInt32":
         return _clamp(_u32, 2**32 - 1)
+    if base == "Int16":
+        return lambda v: _i16(max(-32768, min(32767, int(v or 0))))
     if base == "UInt16":
         return _clamp(_u16, 2**16 - 1)
     if base.startswith("Enum8("):

@@ -74,6 +74,15 @@ TOOLS = [
         "inputSchema": _schema({"n": N, "after": {"type": "integer", "default": 0}, "limit": {"type": "integer", "default": 100}}, ["n"]),
     },
     {
+        "name": "traffic_grpc",
+        "description": (
+            "Messages of one gRPC call in order, both directions (from_client tells which), each decoded from protobuf "
+            "(field names when the proxy has a .proto file, else field numbers). Calls have grpc_service, grpc_method and "
+            "grpc_status (0 = OK) in traffic_get; find them with traffic_search query 'has:grpc' or 'gstatus:!0'."
+        ),
+        "inputSchema": _schema({"n": N, "after": {"type": "integer", "default": 0}, "limit": {"type": "integer", "default": 50}}, ["n"]),
+    },
+    {
         "name": "traffic_curl",
         "description": "A curl command that replays the request of one flow (proxy credentials are not included).",
         "inputSchema": _schema({"n": N}, ["n"]),
@@ -202,6 +211,15 @@ class McpServer:
             return q.sse(int(a["n"]), int(a.get("after", 0)), min(int(a.get("limit", 100)), 1000))
         if name == "traffic_ws":
             return q.ws(int(a["n"]), int(a.get("after", 0)), min(int(a.get("limit", 100)), 1000))
+        if name == "traffic_grpc":
+            out = []
+            for m in q.grpc(int(a["n"]), int(a.get("after", 0)), min(int(a.get("limit", 50)), 500)):
+                if m["decoded"]:
+                    m.pop("base64", None)  # the decoded text says it; keep the context small
+                elif len(m.get("base64", "")) > 2048:
+                    m["base64"], m["cut"] = m["base64"][:2048], "base64 cut at 2 KiB"
+                out.append(m)
+            return out
         if name == "traffic_curl":
             return q.curl(int(a["n"])) or f"no flow #{a['n']}"
         if name == "traffic_sql":

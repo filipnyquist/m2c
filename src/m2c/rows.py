@@ -119,6 +119,7 @@ def http_row(flow: http.HTTPFlow, ident: Identity | None, scan_id: str, n: int, 
         "_req_raw": req.raw_content,
         "_req_ce": req.headers.get("content-encoding"),
         "is_replay": flow.is_replay is not None,
+        "grpc_status": -1,  # no gRPC status (the recorder fills the gRPC columns for gRPC calls)
         **identity_fields(ident),
         **conn_fields(flow.client_conn, flow.server_conn),
     }
@@ -168,10 +169,26 @@ def _finalize_body(row: dict, side: str, cap: int) -> None:
     row.setdefault(capture_key, "buffered")
 
 
+def _finalize_grpc(row: dict, cap: int) -> None:
+    """gRPC compresses each message on its own (grpc-encoding): decompress it, within the same limits as bodies."""
+    data = row.get("data")
+    if not row.get("compressed") or not data or row.get("partial") or row.get("truncated"):
+        return
+    coding = (row.get("encoding") or "").lower()
+    if coding not in ("gzip", "deflate", "zstd", "br"):
+        return  # identity, snappy, unknown: keep the bytes as they are
+    body, decoded, truncated = decode_body(data, coding, cap)
+    if decoded:
+        row["data"], row["decompressed"] = body, True
+        row["truncated"] = truncated
+
+
 def finalize(table: str, row: dict, body_cap: int) -> dict:
     if table == "http_flows":
         _finalize_body(row, "req", body_cap)
         _finalize_body(row, "resp", body_cap)
+    elif table == "grpc_messages":
+        _finalize_grpc(row, body_cap)
     return row
 
 

@@ -144,7 +144,7 @@ def _skipper(type_: str) -> Callable[[bytes, int], int]:
     base = type_.strip()
     if base.startswith("LowCardinality(") and base.endswith(")"):
         base = base[len("LowCardinality(") : -1]
-    widths = {"UUID": 16, "IPv6": 16, "UInt64": 8, "UInt32": 4, "UInt16": 2, "Bool": 1}
+    widths = {"UUID": 16, "IPv6": 16, "UInt64": 8, "UInt32": 4, "UInt16": 2, "Int16": 2, "Bool": 1}
     if base == "String":
         return _skip_string
     if base in widths:
