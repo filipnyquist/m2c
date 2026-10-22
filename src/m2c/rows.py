@@ -94,7 +94,7 @@ def error_kind(flow: http.HTTPFlow) -> str:
     return "other"
 
 
-def http_row(flow: http.HTTPFlow, ident: Identity | None, scan_id: str, n: int, tag: str = "") -> dict:
+def http_row(flow: http.HTTPFlow, ident: Identity | None, scan_id: str, n: int, tag: str = "", replay_of: int = 0) -> dict:
     req, res = flow.request, flow.response
     end = (res.timestamp_end if res is not None else None) or (flow.error.timestamp if flow.error else None) or time.time()
     start = req.timestamp_start or end
@@ -119,6 +119,7 @@ def http_row(flow: http.HTTPFlow, ident: Identity | None, scan_id: str, n: int, 
         "_req_raw": req.raw_content,
         "_req_ce": req.headers.get("content-encoding"),
         "is_replay": flow.is_replay is not None,
+        "replay_of": replay_of,
         "grpc_status": -1,  # no gRPC status (the recorder fills the gRPC columns for gRPC calls)
         **identity_fields(ident),
         **conn_fields(flow.client_conn, flow.server_conn),

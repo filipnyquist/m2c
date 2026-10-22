@@ -1,0 +1,23 @@
+{
+ "preact.mjs": {
+  "package": "preact",
+  "version": "10.29.8",
+  "integrity": "sha512-ej2aVZ+vZ8WO7tvlQWRM9N63A0KzF9q4mWJfDUHgYaIofWY9hu74QdnQrjoPMmZi2/nZ5gN0bJCQF49xQqx09Q==",
+  "source": "package/dist/preact.module.js",
+  "sha256": "25a5df7e9f628a587743c4641a368737a3b218f28ef738ba0376a2d5bdfc948c"
+ },
+ "hooks.mjs": {
+  "package": "preact",
+  "version": "10.29.8",
+  "integrity": "sha512-ej2aVZ+vZ8WO7tvlQWRM9N63A0KzF9q4mWJfDUHgYaIofWY9hu74QdnQrjoPMmZi2/nZ5gN0bJCQF49xQqx09Q==",
+  "source": "package/hooks/dist/hooks.module.js",
+  "sha256": "41391bb2f3153900ffbec61cd06d4ba5a62bb7458d63d83a4cded54245062bc1"
+ },
+ "htm.mjs": {
+  "package": "htm",
+  "version": "3.1.1",
+  "integrity": "sha512-983Vyg8NwUE7JkZ6NmOqpCZ+sh1bKv2iYTlUkzlWmA5JD2acKoxd4KVxbMmxX/85mtfdnDmTFoNKcg5DGAvxNQ==",
+  "source": "package/dist/htm.module.js",
+  "sha256": "ab33dd3f38059b9be4d5f5350128eefb2356639c4e0bbe9d9e8b3ba75847e9e4"
+ }
+}

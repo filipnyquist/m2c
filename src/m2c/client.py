@@ -25,9 +25,10 @@ class Online:
         self.token = token
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never through a proxy
 
-    def _req(self, path: str, params: dict | None = None, data: bytes | None = None, timeout: float = 60):
+    def _req(self, path: str, params: dict | None = None, data: bytes | None = None, timeout: float = 60, method: str | None = None):
         query = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v not in (None, "")})
-        req = urllib.request.Request(self.url + path + ("?" + query if query else ""), data=data, method="POST" if data is not None else "GET")
+        req = urllib.request.Request(self.url + path + ("?" + query if query else ""), data=data,
+                                     method=method or ("POST" if data is not None else "GET"))
         req.add_header("Authorization", f"Bearer {self.token}")
         try:
             return self._opener.open(req, timeout=timeout)
@@ -100,12 +101,50 @@ class Online:
     def har(self, q="", limit=1000):
         return self._json("/v1/har", {"q": q, "limit": limit})
 
-    def events(self, kind="", limit=100):
-        return self._json("/v1/events", {"kind": kind, "limit": limit})
+    def notes(self, ns=None, q="", note_id=None, limit=1000):
+        params = {"q": q, "limit": limit, "ns": ",".join(map(str, ns)) if ns is not None else None}
+        return self._json("/v1/notes", params)
 
-    def sql(self, sql, fmt="JSONEachRow"):
-        with self._req("/v1/sql", {"format": fmt}, data=sql.encode(), timeout=300) as res:
-            return res.read()
+    def _send(self, path, body, method):
+        with self._req(path, data=json.dumps(body).encode() if body is not None else b"", method=method) as res:
+            raw = res.read()
+        return json.loads(raw) if raw else None
+
+    def add_note(self, n, fields):
+        return self._send(f"/v1/flows/{int(n)}/notes", fields, "POST")
+
+    def resend(self, n, overrides):
+        return self._send(f"/v1/flows/{int(n)}/resend", overrides, "POST")
+
+    def change_note(self, nid, fields):
+        return self._send(f"/v1/notes/{nid}", fields, "PATCH")
+
+    def delete_note(self, nid):
+        return self._send(f"/v1/notes/{nid}", None, "DELETE")
+
+    def timeline(self, session, limit=2000):
+        return self._json("/v1/timeline", {"session": session, "limit": limit})
+
+    def call_sessions(self):
+        return self._json("/v1/timeline/sessions")
+
+    def report(self, q="", by="tool", limit=50):
+        return self._json("/v1/report", {"q": q, "by": by, "limit": limit})
+
+    def grep(self, pattern, regex=False, ci=True, side="both", q="", where_in="body", context=80, limit=20, per_flow=3):
+        return self._json("/v1/grep", {"pattern": pattern, "regex": int(regex), "ci": int(ci), "side": side, "q": q, "in": where_in,
+                                       "context": context, "limit": limit, "per_flow": per_flow})
+
+    def diff(self, a, b, max_bytes=256 << 10, redact=True):
+        try:
+            return self._json("/v1/diff", {"a": a, "b": b, "redact": int(redact)})
+        except ClientError as e:
+            if str(e).startswith("404"):
+                return None
+            raise
+
+    def events(self, kind="", limit=100, severity=""):
+        return self._json("/v1/events", {"kind": kind, "limit": limit, "severity": severity})
 
     def tail(self, q="", backlog=0) -> Iterator[dict]:
         res = self._req("/v1/tail", {"q": q, "backlog": backlog}, timeout=None)
@@ -152,10 +191,23 @@ class Offline:
     def tail(self, q="", backlog=0):
         raise ClientError("tail needs a running proxy")
 
+    def add_note(self, n, fields):
+        raise ClientError("notes are written through the running proxy")
+
+    change_note = delete_note = add_note
+
+    def resend(self, n, overrides):
+        raise ClientError("resending needs the running proxy (m2c proxy --repeater admin|on)")
+
     def mcp(self, msg):
         from .mcp import McpServer
 
-        return McpServer(self.q, admin=True).handle_payload(msg)
+        return McpServer(self.q, admin=self.q.scope is None).handle_sync(msg)
+
+    def scoped(self, session: str) -> "Offline":
+        """Answer as a session-scoped token would: one session's flows, no SQL."""
+        self.q.scope = session
+        return self
 
 
 def _alive(pid: int) -> bool:

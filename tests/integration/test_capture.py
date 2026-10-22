@@ -47,16 +47,18 @@ def test_auth_failures_are_events_not_flows(proxy, upstream):
     assert {(e["kind"], e["reason"]) for e in events} == {("auth_rejected", "bad_mac"), ("auth_challenge", "missing")}
 
 
-def test_https_through_connect(proxy, upstream):
+def test_https_through_connect(proxy, tmp_path):
     tok = proxy.token("tls1")
     ca = str(proxy.conf / "mitmproxy-ca-cert.pem")
-    # A TLS upstream isn't available locally; example.com covers CONNECT + interception when the network allows it.
-    res = curl(proxy.url("tls1.curl", tok), "https://example.com/", "--cacert", ca, "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "15")
-    if res.stdout != b"200":
-        pytest.skip("no outbound HTTPS")
+    srv, port = servers.start_tls(str(tmp_path))  # a local self-signed upstream: the proxy doesn't verify upstreams by default
+    try:
+        res = curl(proxy.url("tls1.curl", tok), f"https://localhost:{port}/hello", "--cacert", ca, "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "15")
+    finally:
+        srv.shutdown()
+    assert res.stdout == b"200"
     proxy.stop()
     row = proxy.rows("SELECT session, identity_source, tls, sni, scheme FROM m2c.http_flows")[0]
-    assert row == {"session": "tls1", "identity_source": "connect", "tls": True, "sni": "example.com", "scheme": "https"}
+    assert row == {"session": "tls1", "identity_source": "connect", "tls": True, "sni": "localhost", "scheme": "https"}
 
 
 def test_sse_streams_live_and_events_recorded(proxy, upstream):

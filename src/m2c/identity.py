@@ -14,11 +14,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import os
 import re
 import secrets
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 
 SESSION = re.compile(r"[A-Za-z0-9_-]{1,64}")
 TOOL = re.compile(r"[A-Za-z0-9_-]{1,48}")
@@ -222,3 +224,24 @@ def ua_tool(user_agent: str | None) -> str:
         if pattern.search(user_agent):
             return name
     return "other"
+
+
+def secret_file(data: Path, configured: str) -> Path:
+    return Path(configured) if configured else data / "secret"
+
+
+def load_secrets(data: Path, configured_file: str, env_value: str, create: bool) -> list[str]:
+    """Secrets from M2C_SECRET (comma separated, first one mints) or the secret file, created when missing."""
+    if env_value:
+        return [s.strip() for s in env_value.split(",") if s.strip()]
+    path = secret_file(data, configured_file)
+    if path.exists():
+        return [s.strip() for s in path.read_text().splitlines() if s.strip()]
+    if not create:
+        return []
+    path.parent.mkdir(parents=True, exist_ok=True)
+    secret = secrets.token_urlsafe(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(secret + "\n")
+    return [secret]

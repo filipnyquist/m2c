@@ -38,7 +38,10 @@ CENTRAL_ORDER = {
     "sse_events": ("toYYYYMM(ts)", "scan_id, session, n, seq"),
     "grpc_messages": ("toYYYYMM(ts)", "scan_id, session, n, seq"),
     "proxy_events": ("toYYYYMM(ts)", "scan_id, kind, ts"),
+    "annotations": ("toYYYYMM(ts)", "scan_id, session, n, id, ts"),
 }
+# Tables pushed whole (small): no chunks.
+SMALL_TABLES = ("proxy_events", "annotations")
 # What identifies a row, for the anti-join when a chunk is partly there already.
 KEYS = {
     "http_flows": "flow_id",
@@ -46,6 +49,7 @@ KEYS = {
     "grpc_messages": "flow_id, seq",
     "ws_messages": "flow_id, seq",
     "proxy_events": "ts, kind, session, tool, proxy_user, client_conn_id, reason, host, message",
+    "annotations": "id, ts",
 }
 # Approximate bytes of one row, for the chunk size.
 SIZES = {
@@ -471,9 +475,10 @@ class Pusher:
                     left[table] += gap
                     msg = f"{sent} rows sent" if sent else "already there"
                     self.progress(f"  {table} {label}: {msg}" + (f" ({note})" if note else "") + (f", {gap} still missing" if gap else ""))
-            sent, gap, note = self._push_range("proxy_events", ids, "1", f"{meta['scan_id']}:proxy_events")
-            left["proxy_events"] += gap
-            self.progress(f"  proxy_events: {sent} rows sent" + (f" ({note})" if note else "") + (f", {gap} still missing" if gap else ""))
+            for table in SMALL_TABLES:
+                sent, gap, note = self._push_range(table, ids, "1", f"{meta['scan_id']}:{table}")
+                left[table] += gap
+                self.progress(f"  {table}: {sent} rows sent" + (f" ({note})" if note else "") + (f", {gap} still missing" if gap else ""))
             remote = self.remote_counts(meta["scan_ids"])
         except BaseException as e:  # Ctrl-C too: the row must not stay 'pushing'
             try:

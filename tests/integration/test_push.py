@@ -296,3 +296,18 @@ def test_manual_push_clears_the_marker_and_reports_rejected_spool_rows(tmp_path,
     assert "rows from" in out.stderr and "rejected" in out.stderr and "they are not pushed" in out.stderr
     assert not (data / "push-failed.json").exists()
     assert list((data / "dead").glob("*.rowbinary"))
+
+
+def test_push_carries_annotations(central, tmp_path):
+    data = tmp_path / "data"
+    flows(data, "scan-notes", 3)
+    py(data, """
+        q('''INSERT INTO m2c.annotations (scan_id, id, ts, n, session, author, author_kind, label, note, deleted) VALUES
+             ('scan-notes', '6f1c1c55-0000-4000-8000-000000000001', now64(3), 1, 's', 'admin', 'admin', 'vuln', 'first', false),
+             ('scan-notes', '6f1c1c55-0000-4000-8000-000000000001', now64(3) + 1, 1, 's', 'admin', 'admin', 'vuln', 'edited', false)''')
+    """)
+    url = target(HTTP, central)
+    push(data, url)
+    push(data, url)  # again: nothing doubles
+    assert ch(f"SELECT count() FROM {central}.annotations WHERE scan_id = 'scan-notes'") == "2"
+    assert ch(f"SELECT argMax(note, ts) FROM {central}.annotations WHERE scan_id = 'scan-notes' GROUP BY id") == "edited"

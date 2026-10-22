@@ -9,10 +9,10 @@ import os
 import shlex
 import shutil
 import sys
-from datetime import datetime
 from pathlib import Path
 
-from . import identity, state
+from . import identity
+from .fmt import flow_line as _flow_line, report_text, size as _size, when as _when
 
 DEFAULT_PROXY = "127.0.0.1:8080"
 DEFAULT_DATA = "./m2c-data"
@@ -35,9 +35,9 @@ def _secrets(args, create: bool = False) -> list[str]:
     """The proxy's secrets. Client commands never create one: a secret made next to the wrong data directory mints
     tokens the proxy rejects with 407 and nothing to say why."""
     data, configured = _data(args), args.secret_file or os.environ.get("M2C_SECRET_FILE", "")
-    path = state.secret_file(data, configured)
+    path = identity.secret_file(data, configured)
     try:
-        secrets = state.load_secrets(data, configured, os.environ.get("M2C_SECRET", ""), create=create)
+        secrets = identity.load_secrets(data, configured, os.environ.get("M2C_SECRET", ""), create=create)
     except PermissionError:
         sys.exit(f"m2c: cannot read {path} (the proxy runs as another user?); pass --token or M2C_TOKEN")
     if not secrets:
@@ -68,6 +68,8 @@ def cmd_proxy(args) -> None:
     argv += ["--set", f"m2c_data={data}", "--set", f"m2c_auth={args.auth}", "--set", f"m2c_api_listen={args.api}"]
     if args.no_ui:
         argv += ["--set", "m2c_ui=false"]
+    if args.repeater != "off":
+        argv += ["--set", f"m2c_repeater={args.repeater}"]
     if args.scan_id:
         argv += ["--set", f"m2c_scan_id={args.scan_id}"]
     if args.push_on_exit:
@@ -180,6 +182,10 @@ def proxy_env(args) -> dict[str, str]:
             CURL_CA_BUNDLE=str(bundle),
             GIT_SSL_CAINFO=str(bundle),
             AWS_CA_BUNDLE=str(bundle),
+            NPM_CONFIG_CAFILE=str(bundle),
+            PIP_CERT=str(bundle),
+            CARGO_HTTP_CAINFO=str(bundle),
+            DENO_CERT=str(bundle),
         )
     return env
 
@@ -255,31 +261,6 @@ def _client(args):
     return client
 
 
-def _when(ms: int) -> str:
-    if not ms:
-        return "-"
-    t = datetime.fromtimestamp(ms / 1000)
-    return t.strftime("%H:%M:%S.") + f"{t.microsecond // 1000:03d}"
-
-
-def _size(n: int) -> str:
-    n = int(n or 0)
-    for unit in ("B", "K", "M", "G"):
-        if n < 1024 or unit == "G":
-            return f"{n}{unit}" if unit == "B" else f"{n:.1f}{unit}"
-        n /= 1024
-    return str(n)
-
-
-def _flow_line(f: dict, width: int = 0) -> str:
-    status = str(f["status"]) if f["status"] else ("ERR" if f.get("error") else "-")
-    flags = {"sse": " sse", "websocket": " ws"}.get(f.get("resp_capture", ""), "")
-    who = f"{f['session']}/{f['tool']}" + (f"#{f['call_id']}" if f.get("call_id") else "")
-    target = f"{f['host']}{f['path']}"
-    line = f"{f['n']:>6}  {_when(f['ts'])}  {who:<24.24}  {f['method']:<7} {status:<4} {_size(f['resp_body_size']):>7} {f['duration_ms']:>6}ms{flags}  {target}"
-    return line[:width] if width else line
-
-
 def _out_json(value) -> None:
     print(json.dumps(value, ensure_ascii=False, default=str))
 
@@ -291,7 +272,7 @@ def _run_client(fn):
         return fn()
     except ClientError as e:
         sys.exit(f"m2c: {e}")
-    except Exception as e:  # noqa: BLE001 - offline query errors (bad filter, bad SQL)
+    except Exception as e:  # noqa: BLE001 - offline query errors (a bad filter, a bad regex)
         sys.exit(f"m2c: {e}")
 
 
@@ -312,6 +293,36 @@ def cmd_sessions(args) -> None:
     print(f"{'session':<24} {'tool':<16} {'flows':>6} {'fail':>5} {'hosts':>5} {'up':>8} {'down':>8}  last seen")
     for r in rows:
         print(f"{r['session']:<24.24} {r['tool']:<16.16} {r['flows']:>6} {r['failures']:>5} {r['hosts']:>5} {_size(r['bytes_up']):>8} {_size(r['bytes_down']):>8}  {_when(r['last_seen'])}")
+
+
+def cmd_report(args) -> None:
+    rep = _run_client(lambda: _client(args).report(args.query or "", args.by, args.limit))
+    if args.json:
+        _out_json(rep)
+    else:
+        print(report_text(rep))
+
+
+def cmd_grep(args) -> None:
+    hits = _run_client(lambda: _client(args).grep(args.pattern, args.regex, not args.case_sensitive, args.side, args.query or "",
+                                                 args.where_in, args.context, args.limit, args.per_flow))
+    if args.json:
+        for h in hits:
+            _out_json(h)
+        return
+    for h in hits:
+        where = f" event {h['seq']}" if "seq" in h else ""
+        print(f"#{h['n']}{where}  {h['session']}/{h['tool']}  " + (f"{h['method']} {h['status'] or '-'} {h['host']}{h['path']}" if "method" in h else ""))
+        for key, mark in (("req_hits", ">"), ("resp_hits", "<"), ("hits", "|")):
+            for snippet in h.get(key, []):
+                print(f"  {mark} " + snippet.replace("\r", "").replace("\n", "\u23ce "))
+
+
+def cmd_diff(args) -> None:
+    out = _run_client(lambda: _client(args).diff(args.a, args.b, 256 << 10, not args.no_redact))
+    if out is None:
+        sys.exit(f"m2c: no flow #{args.a} or #{args.b}")
+    print(json.dumps(out, ensure_ascii=False, indent=None if args.json else 2, default=str))
 
 
 def cmd_ls(args) -> None:
@@ -475,18 +486,109 @@ def cmd_events(args) -> None:
         else:
             who = f"{r['session']}/{r['tool']}" if r["session"] else (r["proxy_user"] or "-")
             print(f"{_when(r['ts'])}  {r['kind']:<16} {r['severity']:<5} {who:<24.24} {r['reason']:<10} {r['host']}{':' + str(r['port']) if r['port'] else ''} {r['message'][:120]}")
+            if r.get("fix"):
+                print(f"{'':14}fix: {r['fix']}")
 
 
-def cmd_sql(args) -> None:
-    out = _run_client(lambda: _client(args).sql(args.query, args.format))
-    sys.stdout.buffer.write(out)
-    sys.stdout.flush()
+def cmd_notes(args) -> None:
+    notes = [x for x in _run_client(lambda: _client(args).notes(None, args.query or "", None, args.limit)) if not x["deleted"]]
+    for x in sorted(notes, key=lambda x: (x["n"], x["created"])):
+        if args.json:
+            _out_json(x)
+        else:
+            label = f"[{x['label']}] " if x["label"] else ""
+            print(f"#{x['n']:<6} {_when(x['updated'])}  {x['session']:<16.16} {label}{x['note'][:200]}  ({x['author']}, {x['id'][:8]})")
+
+
+def cmd_note(args) -> None:
+    c = _client(args)
+    if args.delete:
+        _run_client(lambda: c.delete_note(_note_id(c, args.n, args.delete)))
+        print(f"deleted note {args.delete} on #{args.n}")
+        return
+    fields = {k: v for k, v in (("label", args.label), ("color", args.color), ("note", " ".join(args.text) if args.text else None)) if v is not None}
+    if args.edit:
+        note = _run_client(lambda: c.change_note(_note_id(c, args.n, args.edit), fields))
+    else:
+        note = _run_client(lambda: c.add_note(args.n, fields))
+    print(json.dumps(note) if args.json else f"#{note['n']} note {note['id']}" + (f" [{note['label']}]" if note["label"] else ""))
+
+
+def _note_id(c, n: int, prefix: str) -> str:
+    """A note on flow n by id or id prefix (as `m2c notes` prints it)."""
+    found = [x["id"] for x in _run_client(lambda: c.notes([n])) if x["id"].startswith(prefix.lower()) and not x["deleted"]]
+    if len(found) != 1:
+        sys.exit(f"m2c: {'no' if not found else 'more than one'} note {prefix} on #{n}")
+    return found[0]
+
+
+def cmd_timeline(args) -> None:
+    c = _client(args)
+    session = args.session
+    if not session:
+        known = _run_client(lambda: c.call_sessions())
+        if not known:
+            sys.exit("m2c: no flows carry call ids yet (see `m2c hooks claude-code`)")
+        session = known[0]["session"]
+    tl = _run_client(lambda: c.timeline(session, args.limit))
+    if args.json:
+        _out_json(tl)
+        return
+    for item in tl["items"]:
+        if item["kind"] == "call":
+            failed = f", {item['failures']} failed" if item["failures"] else ""
+            print(f"{_when(item['start_ts'])}  call {item['call_id']} ({item['tool']}): {len(item['flows'])} flows{failed}, "
+                  f"{item['end_ts'] - item['start_ts']} ms")
+        else:
+            print(f"{'':14}without a call id: {len(item['flows'])} flows")
+        for f in item["flows"]:
+            print("    " + _flow_line(f))
+
+
+def cmd_resend(args) -> None:
+    overrides: dict = {}
+    if args.method:
+        overrides["method"] = args.method
+    if args.url:
+        overrides["url"] = args.url
+    if args.header or args.drop_header:
+        c = _client(args)
+        flow = _run_client(lambda: c.flow(args.n))
+        if flow is None:
+            sys.exit(f"m2c: no flow #{args.n}")
+        headers = [list(h) for h in flow["req_headers"]]
+        for h in args.header or []:
+            name, sep, value = h.partition(":")
+            if not sep:
+                sys.exit(f"m2c: -H takes 'Name: value', got {h!r}")
+            headers = [x for x in headers if x[0].lower() != name.strip().lower()] + [[name.strip(), value.strip()]]
+        overrides["headers"] = headers
+        if args.drop_header:
+            overrides["headers_remove"] = args.drop_header
+    if args.body is not None:
+        overrides["body"] = sys.stdin.read() if args.body == "@-" else args.body
+    out = _run_client(lambda: _client(args).resend(args.n, overrides))
+    if args.json:
+        _out_json(out)
+        return
+    print(f"#{out['n']} (resent #{out['replay_of']}): {out['method']} {out['url']} -> {out['status'] or 'ERR'} {out['reason']}"
+          + (f" ({out['error']})" if out["error"] else "") + f", {out['duration_ms']} ms")
+    print(f"compare: m2c diff {out['replay_of']} {out['n']}")
 
 
 def cmd_mcp(args) -> None:
     from .mcp import serve_stdio
 
     c = _client(args)
+    if args.session:
+        if not identity.SESSION.fullmatch(args.session):
+            sys.exit(f"m2c mcp: --session must match {identity.SESSION.pattern}")
+        if c.online:  # a session-scoped API token: needs `m2c proxy --auth token` (the default)
+            c.token = f"{args.session}:{identity.mint(_secrets(args)[0], args.session)}"
+        else:
+            c.scoped(args.session)
+    elif not (args.token or os.environ.get("M2C_API_TOKEN")):
+        print("m2c mcp: serving as admin (every session); --session S limits it to one agent session", file=sys.stderr)
     serve_stdio(c.mcp, sys.stdin.buffer, sys.stdout)  # a failing request gets an error reply; the server keeps going
 
 
@@ -508,53 +610,63 @@ def cmd_ca(args) -> None:
         print(bundle)
 
 
-CLAUDE_HOOK = {
-    "hooks": {
-        "SessionStart": [
-            {"hooks": [{"type": "command", "command": "m2c hook claude-code-session-start"}]}
-        ]
-    }
-}
+def claude_hooks(m2c: str, data: Path) -> dict:
+    """Claude Code settings: the proxy for Bash commands, each Bash call's requests tagged with its tool_use_id."""
+    cmd = lambda event: f"{shlex.quote(m2c)} hook {event} --data {shlex.quote(str(data))}"  # noqa: E731
+    return {"hooks": {
+        "SessionStart": [{"hooks": [{"type": "command", "command": cmd("claude-code-session-start")}]}],
+        "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": cmd("claude-code-pre-tool"), "timeout": 5}]}],
+    }}
 
 
 def cmd_hooks(args) -> None:
     if args.harness == "claude-code":
-        print("# Add to .claude/settings.json (project) or ~/.claude/settings.json. Bash commands Claude runs then go")
-        print("# through the proxy as <session_id>.bash; Claude Code's own API traffic does not.", file=sys.stderr)
-        print(json.dumps(CLAUDE_HOOK, indent=2))
+        m2c = shutil.which("m2c") or os.path.abspath(sys.argv[0])
+        print("# Add to .claude/settings.json (project) or ~/.claude/settings.json.", file=sys.stderr)
+        print("# Bash commands then go through the proxy as <session_id>.bash.<tool_use_id>: the timeline groups each", file=sys.stderr)
+        print("# call's flows. Nothing about the calls themselves is recorded, and Claude Code's own API traffic never", file=sys.stderr)
+        print("# goes through the proxy.", file=sys.stderr)
+        print(json.dumps(claude_hooks(m2c, _data(args).resolve()), indent=2))
     else:
         print("# Generic harness: give each agent run its own session id and run tools with")
         print("#   m2c run --session <run id> --tool <tool> -- <command ...>")
         print("# or export the variables once per run (only into the tools' environment, never the agent's own):")
         print("#   eval \"$(m2c env --session <run id> --tool <tool>)\"")
         print("# A long-lived client can name the tool per request with the header  x-m2c-tool: <tool>")
-
-
-def _session_id(raw: str) -> str:
-    import re
-
-    cleaned = re.sub(r"[^A-Za-z0-9_-]", "-", raw)[:64].strip("-")
-    return cleaned or "session"
+        print("# Name each tool call in the proxy username (<session>.<tool>.<call id>) to group its flows in the timeline.")
 
 
 def cmd_hook(args) -> None:
-    """Called by a harness hook; reads the hook's JSON on stdin."""
-    if args.event != "claude-code-session-start":
-        sys.exit(f"m2c: unknown hook {args.event}")
+    """Called by a harness hook; reads the hook's JSON on stdin. Tool hooks never fail the tool call."""
+    from . import hooks
+
     try:
         event = json.load(sys.stdin)
     except ValueError:
         event = {}
-    env_file = os.environ.get("CLAUDE_ENV_FILE")
-    if not env_file:
-        print("m2c: CLAUDE_ENV_FILE is not set; nothing to do", file=sys.stderr)
+    if not isinstance(event, dict):
+        event = {}
+    if args.event == "claude-code-session-start":
+        env_file = os.environ.get("CLAUDE_ENV_FILE")
+        if not env_file:
+            print("m2c: CLAUDE_ENV_FILE is not set; nothing to do", file=sys.stderr)
+            return
+        args.session = hooks.session_id(event.get("session_id"))
+        args.tool, args.call, args.token, args.no_proxy = args.tool or "bash", "", None, None
+        env = proxy_env(args)
+        extra = {"M2C_SESSION": args.session, "M2C_DATA": str(_data(args).resolve())}
+        try:
+            meta = json.loads((_data(args) / "api.json").read_text())
+            extra.update(M2C_API=meta["url"], M2C_API_TOKEN=f"{args.session}:{identity.mint(_secrets(args)[0], args.session)}")
+        except (OSError, ValueError, KeyError, SystemExit):
+            pass  # no running proxy (yet) or no secret here: the tools still get the proxy
+        with open(env_file, "a") as f:
+            f.write(hooks.env_snippet(env, args.session, args.tool, extra))
         return
-    args.session = _session_id(str(event.get("session_id") or "session"))
-    args.tool, args.call, args.token, args.no_proxy = args.tool or "bash", "", None, None
-    env = proxy_env(args)
-    with open(env_file, "a") as f:
-        for k, v in env.items():
-            f.write(f"export {k}={shlex.quote(v)}\n")
+    try:  # claude-code-pre-tool
+        hooks.mark_call(event)
+    except Exception as e:  # noqa: BLE001 - a hook must never get in the way of the tool call
+        hooks.log_problem(_data(args), f"{args.event}: {type(e).__name__}: {e}")
 
 
 def cmd_doctor(args) -> None:
@@ -598,7 +710,26 @@ def cmd_doctor(args) -> None:
         print(f"warn this shell has proxy variables set ({', '.join(sorted(leaked))} -> {next(iter(leaked.values()))}).")
         print("     Only tool subprocesses should get them: if this is the agent harness's own environment, its LLM API")
         print("     traffic would go through the proxy (and be recorded).")
+    if info.exists():
+        _doctor_tls(meta)
     sys.exit(0 if ok else 1)
+
+
+def _doctor_tls(meta: dict) -> None:
+    """Tools whose TLS handshakes failed because they don't trust the proxy CA, with where each reads its CAs."""
+    from .advice import ca_hint
+    from .client import ClientError, Online
+
+    try:
+        events = Online(meta["url"], meta["token"]).events("tls_failed_client", 1000)
+    except (ClientError, KeyError):
+        return
+    by_tool: dict[tuple[str, str], int] = {}
+    for e in events:
+        key = (e.get("session") or "-", e.get("tool") or "")
+        by_tool[key] = by_tool.get(key, 0) + 1
+    for (session, tool), count in sorted(by_tool.items(), key=lambda x: -x[1])[:10]:
+        print(f"warn {session}/{tool or '?'}: {count} TLS handshakes failed (the client doesn't trust the m2c CA). {ca_hint(tool)}")
 
 
 # --------------------------------------------------------------------------- central ClickHouse
@@ -713,6 +844,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--scan-id", default=os.environ.get("M2C_SCAN_ID", ""))
     sp.add_argument("--api", default=os.environ.get("M2C_API_LISTEN", "127.0.0.1:8124"), help="API/MCP/UI address; empty to turn it off")
     sp.add_argument("--no-ui", action="store_true", help="don't serve the web UI")
+    sp.add_argument("--repeater", choices=("off", "admin", "on"), default=os.environ.get("M2C_REPEATER", "off"),
+                    help="let the API/UI/MCP resend recorded requests: admin token only, or also session tokens for their own flows")
     sp.add_argument("--push-on-exit", default=os.environ.get("M2C_PUSH_ON_EXIT", ""), help="central ClickHouse URL to push to at shutdown")
     sp.add_argument("--proto", default=os.environ.get("M2C_PROTO_FILE", ""), help="a .proto file naming gRPC message fields in the API, UI and MCP")
     sp.add_argument("--label", action="append", help="key=value for the central scans row (repeatable)")
@@ -761,6 +894,44 @@ def build_parser() -> argparse.ArgumentParser:
     reader("stats", "scan totals and writer counters", cmd_stats)
     sp = reader("sessions", "per session and tool summary", cmd_sessions)
     sp.add_argument("query", nargs="?", default="")
+    sp = reader("resend", "resend a recorded request through the proxy, edited or not (needs m2c proxy --repeater)", cmd_resend)
+    sp.add_argument("n", type=int)
+    sp.add_argument("-X", "--method")
+    sp.add_argument("--url")
+    sp.add_argument("-H", "--header", action="append", help="'Name: value' (replaces that header; repeatable)")
+    sp.add_argument("--drop-header", action="append", help="a header name to leave out (repeatable)")
+    sp.add_argument("-d", "--body", help="the body to send ('@-' reads stdin); default: the recorded body")
+    sp = reader("notes", "labels and notes on the flows a query matches", cmd_notes)
+    sp.add_argument("query", nargs="?", default="")
+    sp.add_argument("--limit", type=int, default=1000)
+    sp = reader("note", "label or note a flow (or --edit / --delete one); needs the running proxy", cmd_note)
+    sp.add_argument("n", type=int)
+    sp.add_argument("text", nargs="*", help="the note's text")
+    sp.add_argument("-l", "--label")
+    sp.add_argument("--color", choices=("red", "orange", "yellow", "green", "blue", "purple", "gray"))
+    sp.add_argument("--edit", metavar="ID", help="change this note (id or prefix) instead of adding one")
+    sp.add_argument("--delete", metavar="ID", help="delete this note (id or prefix)")
+    sp = reader("timeline", "a session's flows grouped by the tool call that made them (the proxy username's call id)", cmd_timeline)
+    sp.add_argument("session", nargs="?", default="", help="default: the session with the latest call")
+    sp.add_argument("--limit", type=int, default=2000, help="the session's last N flows")
+    sp = reader("report", "per session, tool or call: flows, failures, hosts, statuses, slowest", cmd_report)
+    sp.add_argument("query", nargs="?", default="")
+    sp.add_argument("--by", choices=("session", "tool", "call"), default="tool")
+    sp.add_argument("--limit", type=int, default=50)
+    sp = reader("grep", "find text in bodies (or SSE/WebSocket data) and show it in context", cmd_grep)
+    sp.add_argument("pattern")
+    sp.add_argument("query", nargs="?", default="", help="narrow the flows (filter language)")
+    sp.add_argument("-E", "--regex", action="store_true", help="PATTERN is an RE2 regular expression")
+    sp.add_argument("-s", "--case-sensitive", action="store_true")
+    sp.add_argument("--side", choices=("req", "resp", "both"), default="both")
+    sp.add_argument("--in", dest="where_in", choices=("body", "sse", "ws"), default="body")
+    sp.add_argument("-C", "--context", type=int, default=80)
+    sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument("--per-flow", type=int, default=3)
+    sp = reader("diff", "what differs between two flows", cmd_diff)
+    sp.add_argument("a", type=int)
+    sp.add_argument("b", type=int)
+    sp.add_argument("--no-redact", action="store_true", help="show credential header values")
     sp = reader("ls", "list flows (newest last); QUERY uses the filter language", cmd_ls)
     sp.add_argument("query", nargs="?", default="")
     sp.add_argument("-n", "--limit", type=int, default=50)
@@ -794,10 +965,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = reader("events", "proxy events: auth failures, TLS failures, health", cmd_events)
     sp.add_argument("--kind", default="")
     sp.add_argument("--limit", type=int, default=100)
-    sp = reader("sql", "read-only SQL", cmd_sql)
-    sp.add_argument("query")
-    sp.add_argument("--format", default="PrettyCompactMonoBlock", help="any ClickHouse output format")
-    reader("mcp", "MCP server over stdio (forwards to the live API, or reads a stopped scan)", cmd_mcp)
+    sp = reader("mcp", "MCP server over stdio (forwards to the live API, or reads a stopped scan)", cmd_mcp)
+    sp.add_argument("--session", help="scope the server to one session (a session token minted from the secret); default: admin")
 
     sp = sub.add_parser("ca", help="the proxy's CA certificate: path, pem, or a combined system+proxy bundle")
     common(sp)
@@ -805,12 +974,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(fn=cmd_ca)
 
     sp = sub.add_parser("hooks", help="print the integration snippet for a harness")
+    common(sp)
     sp.add_argument("harness", choices=("claude-code", "generic"))
     sp.set_defaults(fn=cmd_hooks)
 
     sp = sub.add_parser("hook", help="entry point for harness hooks (reads the hook event on stdin)")
     common(sp, proxy=True)
-    sp.add_argument("event", choices=("claude-code-session-start",))
+    sp.add_argument("event", choices=("claude-code-session-start", "claude-code-pre-tool"))
     sp.add_argument("--tool", default="bash")
     sp.set_defaults(fn=cmd_hook)
 

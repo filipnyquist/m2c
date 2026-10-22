@@ -15,7 +15,6 @@ import atexit
 import json
 import logging
 import os
-import secrets as _secrets
 import socket
 import threading
 import uuid
@@ -26,8 +25,10 @@ from mitmproxy import http
 
 from . import __version__, rows
 from .db import Database
-from .identity import Authenticator, Identity
+from .identity import Authenticator, Identity, load_secrets, secret_file  # noqa: F401 - re-exported
 from .live import LiveFeed
+from .notes import Notes
+from .repeater import Repeater
 from .writer import Writer, spool_files
 
 log = logging.getLogger("m2c")
@@ -64,6 +65,9 @@ class Config:
     grpc_msg_cap: int = 256 * 1024
     grpc_max_messages: int = 100_000
     proto_file: str = ""
+    annotations: bool = True
+    repeater: str = "off"  # off | admin | on
+    repeater_timeout: int = 30
 
 
 @dataclass
@@ -90,29 +94,9 @@ class FlowState:
     grpc_req: int = 0
     grpc_resp: int = 0
     grpc_web_trailers: list = field(default_factory=list)
+    replay_of: int = 0  # the flow the repeater resent
     recorded: bool = False  # its http_flows row is queued: later SSE events (teardown at shutdown) are not kept
     extra: dict = field(default_factory=dict)
-
-
-def secret_file(data: Path, configured: str) -> Path:
-    return Path(configured) if configured else data / "secret"
-
-
-def load_secrets(data: Path, configured_file: str, env_value: str, create: bool) -> list[str]:
-    """Secrets from M2C_SECRET (comma separated, first one mints) or the secret file, created when missing."""
-    if env_value:
-        return [s.strip() for s in env_value.split(",") if s.strip()]
-    path = secret_file(data, configured_file)
-    if path.exists():
-        return [s.strip() for s in path.read_text().splitlines() if s.strip()]
-    if not create:
-        return []
-    path.parent.mkdir(parents=True, exist_ok=True)
-    secret = _secrets.token_urlsafe(32)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(secret + "\n")
-    return [secret]
 
 
 class State:
@@ -138,6 +122,8 @@ class State:
         self.live_ws: dict[str, http.HTTPFlow] = {}
         self.tunnels: dict[str, dict] = {}  # TCP flows mitmproxy forwards without parsing (not HTTP)
         self.live = LiveFeed(config.ring_size)
+        self.notes = Notes(self.writer, config.scan_id, config.annotations)
+        self.repeater = Repeater(config.repeater, config.repeater_timeout)
         self.api = None
         self.closed = False
 

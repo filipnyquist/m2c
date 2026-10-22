@@ -132,6 +132,7 @@ HTTP_FLOWS = Table(
         C("error_kind", LC),
         C("end_reason", END_REASON),
         C("is_replay", "Bool"),
+        C("replay_of", "UInt64"),  # the flow this one resent (m2c's repeater); 0 for others
         # gRPC calls (application/grpc*): status from trailers, a trailers-only response, a gRPC-Web trailer frame,
         # or inferred from how the call ended. grpc_status is -1 when there is none.
         C("grpc", "Bool"),
@@ -262,10 +263,57 @@ PROXY_EVENTS = Table(
     order_by="kind, ts",
 )
 
-TABLES = {t.name: t for t in (HTTP_FLOWS, WS_MESSAGES, SSE_EVENTS, GRPC_MESSAGES, PROXY_EVENTS)}
+# Labels and notes on flows, written by people and agents through the API. Append-only: an edit or a delete is a
+# new version of the same id; readers take each id's latest version (argMax by ts).
+ANNOTATIONS = Table(
+    "annotations",
+    (
+        C("scan_id", LC),
+        C("id", "UUID"),
+        C("ts", TS, TS_CODEC),
+        C("flow_id", "UUID"),
+        C("n", "UInt64"),
+        C("session", LC),  # the flow's session: what a session token may see and annotate
+        C("author", LC),
+        C("author_kind", "Enum8('admin' = 1, 'session' = 2)"),
+        C("label", LC),
+        C("color", LC),
+        C("note", "String", BIG),
+        C("deleted", "Bool"),
+    ),
+    order_by="session, n, id, ts",
+)
 
-# A failed flow: an HTTP error, a transport error, or a gRPC call that did not end OK.
+TABLES = {t.name: t for t in (HTTP_FLOWS, WS_MESSAGES, SSE_EVENTS, GRPC_MESSAGES, PROXY_EVENTS, ANNOTATIONS)}
+
+# What the label:, note: and has:note filters read: each annotation's latest label, text and deleted flag.
+NOTES_FILTER = (
+    f"SELECT argMax(n, ts) AS n, argMax(label, ts) AS label, argMax(note, ts) AS note, argMax(deleted, ts) AS deleted "
+    f"FROM {DB}.annotations GROUP BY id"
+)
+
+# Each annotation's latest version, deleted ones included (filter on `deleted`).
+NOTES_LATEST = (
+    f"SELECT toString(id) AS id, argMax(n, ts) AS n, toString(argMax(flow_id, ts)) AS flow_id, argMax(session, ts) AS session, "
+    f"argMax(author, ts) AS author, "
+    f"toString(argMax(author_kind, ts)) AS author_kind, argMax(label, ts) AS label, argMax(color, ts) AS color, "
+    f"argMax(note, ts) AS note, argMax(deleted, ts) AS deleted, toUnixTimestamp64Milli(min(ts)) AS created, "
+    f"toUnixTimestamp64Milli(max(ts)) AS updated FROM {DB}.annotations GROUP BY id"
+)
+
+# The failure vocabulary, as SQL and as the same predicate over a flow summary (live tail, UI, MCP):
+#   ERROR  - something went wrong: a transport error, a 5xx, or a gRPC call that did not end OK  (has:error)
+#   FAILED - ERROR or a 4xx: the request did not succeed                                          (has:fail, "failures")
+ERROR = "(error != '' OR status >= 500 OR (grpc AND grpc_status > 0))"
 FAILED = "(status >= 400 OR error != '' OR (grpc AND grpc_status > 0))"
+
+
+def is_error(s: dict) -> bool:
+    return bool(s.get("error")) or s.get("status", 0) >= 500 or (bool(s.get("grpc")) and s.get("grpc_status", -1) > 0)
+
+
+def is_failed(s: dict) -> bool:
+    return is_error(s) or s.get("status", 0) >= 400
 
 SESSION_SUMMARY = f"""CREATE OR REPLACE VIEW {DB}.session_summary AS
 SELECT session, tool, min(ts_start) AS first_seen, max(ts_end) AS last_seen, count() AS flows,

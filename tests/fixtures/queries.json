@@ -1,0 +1,446 @@
+[
+ {
+  "q": "",
+  "nodes": []
+ },
+ {
+  "q": "host:api.acme.test",
+  "nodes": [
+   {
+    "neg": false,
+    "key": "host",
+    "values": [
+     "api.acme.test"
+    ],
+    "start": 0,
+    "end": 18
+   }
+  ]
+ },
+ {
+  "q": "  tool:nuclei|ffuf   status:5xx ",
+  "nodes": [
+   {
+    "neg": false,
+    "key": "tool",
+    "values": [
+     "nuclei",
+     "ffuf"
+    ],
+    "start": 2,
+    "end": 18
+   },
+   {
+    "neg": false,
+    "key": "status",
+    "values": [
+     "5xx"
+    ],
+    "start": 21,
+    "end": 31
+   }
+  ]
+ },
+ {
+  "q": "-status:404",
+  "nodes": [
+   {
+    "neg": true,
+    "key": "status",
+    "values": [
+     "404"
+    ],
+    "start": 0,
+    "end": 11
+   }
+  ]
+ },
+ {
+  "q": "-foo",
+  "nodes": [
+   {
+    "neg": false,
+    "key": null,
+    "values": [
+     "-foo"
+    ],
+    "start": 0,
+    "end": 4
+   }
+  ]
+ },
+ {
+  "q": "Host:X",
+  "nodes": [
+   {
+    "neg": false,
+    "key": "host",
+    "values": [
+     "X"
+    ],
+    "start": 0,
+    "end": 6
+   }
+  ]
+ },
+ {
+  "q": "unknown:x",
+  "nodes": [
+   {
+    "neg": false,
+    "key": null,
+    "values": [
+     "unknown:x"
+    ],
+    "start": 0,
+    "end": 9
+   }
+  ]
+ },
+ {
+  "q": "body:\"two words\"",
+  "nodes": [
+   {
+    "neg": false,
+    "key": "body",
+    "values": [
+     "two words"
+    ],
+    "start": 0,
+    "end": 16
+   }
+  ]
+ },
+ {
+  "q": "body:'single q'",
+  "nodes": [
+   {
+    "neg": false,
+    "key": "body",
+    "values": [
+     "single q"
+    ],
+    "start": 0,
+    "end": 15
+   }
+  ]
+ },
+ {
+  "q": "url:a|b",
+  "nodes": [
+   {
+    "neg": false,
+    "key": "url",
+    "values": [
+     "a|b"
+    ],
+    "start": 0,
+    "end": 7
+   }
+  ]
+ },
+ {
+  "q": "x\\ y",
+  "nodes": [
+   {
+    "neg": false,
+    "key": null,
+    "values": [
+     "x y"
+    ],
+    "start": 0,
+    "end": 4
+   }
+  ]
+ },
+ {
+  "q": "say\"hi there\"",
+  "nodes": [
+   {
+    "neg": false,
+    "key": null,
+    "values": [
+     "sayhi there"
+    ],
+    "start": 0,
+    "end": 13
+   }
+  ]
+ },
+ {
+  "q": "-(tool:ffuf status:404) host:a",
+  "nodes": [
+   {
+    "neg": true,
+    "group": [
+     {
+      "neg": false,
+      "key": "tool",
+      "values": [
+       "ffuf"
+      ],
+      "start": 2,
+      "end": 11
+     },
+     {
+      "neg": false,
+      "key": "status",
+      "values": [
+       "404"
+      ],
+      "start": 12,
+      "end": 22
+     }
+    ],
+    "start": 0,
+    "end": 23
+   },
+   {
+    "neg": false,
+    "key": "host",
+    "values": [
+     "a"
+    ],
+    "start": 24,
+    "end": 30
+   }
+  ]
+ },
+ {
+  "q": "-(a -(b c)) d",
+  "nodes": [
+   {
+    "neg": true,
+    "group": [
+     {
+      "neg": false,
+      "key": null,
+      "values": [
+       "a"
+      ],
+      "start": 2,
+      "end": 3
+     },
+     {
+      "neg": true,
+      "group": [
+       {
+        "neg": false,
+        "key": null,
+        "values": [
+         "b"
+        ],
+        "start": 6,
+        "end": 7
+       },
+       {
+        "neg": false,
+        "key": null,
+        "values": [
+         "c"
+        ],
+        "start": 8,
+        "end": 9
+       }
+      ],
+      "start": 4,
+      "end": 10
+     }
+    ],
+    "start": 0,
+    "end": 11
+   },
+   {
+    "neg": false,
+    "key": null,
+    "values": [
+     "d"
+    ],
+    "start": 12,
+    "end": 13
+   }
+  ]
+ },
+ {
+  "q": "(tool:x)",
+  "nodes": [
+   {
+    "neg": false,
+    "group": [
+     {
+      "neg": false,
+      "key": "tool",
+      "values": [
+       "x"
+      ],
+      "start": 1,
+      "end": 7
+     }
+    ],
+    "start": 0,
+    "end": 8
+   }
+  ]
+ },
+ {
+  "q": "path:/a(b)",
+  "nodes": [
+   {
+    "neg": false,
+    "key": "path",
+    "values": [
+     "/a(b)"
+    ],
+    "start": 0,
+    "end": 10
+   }
+  ]
+ },
+ {
+  "q": "\"(lit\" n:1",
+  "nodes": [
+   {
+    "neg": false,
+    "key": null,
+    "values": [
+     "(lit"
+    ],
+    "start": 0,
+    "end": 6
+   },
+   {
+    "neg": false,
+    "key": "n",
+    "values": [
+     "1"
+    ],
+    "start": 7,
+    "end": 10
+   }
+  ]
+ },
+ {
+  "q": "x)",
+  "nodes": [
+   {
+    "neg": false,
+    "key": null,
+    "values": [
+     "x)"
+    ],
+    "start": 0,
+    "end": 2
+   }
+  ]
+ },
+ {
+  "q": "err:",
+  "nodes": [
+   {
+    "neg": false,
+    "key": "err",
+    "values": [
+     ""
+    ],
+    "start": 0,
+    "end": 4
+   }
+  ]
+ },
+ {
+  "q": "has:sse|ws",
+  "nodes": [
+   {
+    "neg": false,
+    "key": "has",
+    "values": [
+     "sse",
+     "ws"
+    ],
+    "start": 0,
+    "end": 10
+   }
+  ]
+ },
+ {
+  "q": "hdr:x-api-key=*abc*",
+  "nodes": [
+   {
+    "neg": false,
+    "key": "hdr",
+    "values": [
+     "x-api-key=*abc*"
+    ],
+    "start": 0,
+    "end": 19
+   }
+  ]
+ },
+ {
+  "q": "dur:>2s size:<1m",
+  "nodes": [
+   {
+    "neg": false,
+    "key": "dur",
+    "values": [
+     ">2s"
+    ],
+    "start": 0,
+    "end": 7
+   },
+   {
+    "neg": false,
+    "key": "size",
+    "values": [
+     "<1m"
+    ],
+    "start": 8,
+    "end": 16
+   }
+  ]
+ },
+ {
+  "q": "note:\"a|b c\" label:vuln|todo",
+  "nodes": [
+   {
+    "neg": false,
+    "key": "note",
+    "values": [
+     "a|b c"
+    ],
+    "start": 0,
+    "end": 12
+   },
+   {
+    "neg": false,
+    "key": "label",
+    "values": [
+     "vuln",
+     "todo"
+    ],
+    "start": 13,
+    "end": 28
+   }
+  ]
+ },
+ {
+  "q": "status:",
+  "error": "status: needs a value"
+ },
+ {
+  "q": "(a",
+  "error": "unclosed ("
+ },
+ {
+  "q": "()",
+  "error": "empty ( )"
+ },
+ {
+  "q": "-(",
+  "error": "unclosed ("
+ },
+ {
+  "q": "\"open",
+  "error": "bad quoting: No closing quotation"
+ }
+]

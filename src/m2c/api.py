@@ -1,11 +1,12 @@
 """The live API, served by tornado (a mitmproxy dependency) on mitmproxy's own event loop.
 
 chDB locks the data directory to this process, so every live read comes through here. Queries run on two small
-thread pools, each thread with its own read-only chDB session: the heavy lane (ad-hoc SQL, body: searches, HAR,
+thread pools, each thread with its own read-only chDB session: the heavy lane (body: searches, grep, reports, HAR,
 database-filtered tails) is apart from the interactive one, so a slow query never blocks the writer or `ls`.
 Session-scoped callers get at most one heavy query and a share of the interactive lane at a time, and work whose
 client has gone is skipped. `tail` streams from the in-memory live feed. Auth: `Authorization: Bearer <admin token>`
-(everything) or `Bearer <session>:<proxy token>` (that session only, no SQL, no proxy events).
+(everything) or `Bearer <session>:<proxy token>` (that session only, and only the proxy events that concern it).
+There is no raw SQL endpoint: everything goes through the filter language and the queries in queries.py.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import os
 import secrets
 import threading
 import time
+import urllib.parse
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from importlib import resources
@@ -31,9 +33,12 @@ import tornado.web
 
 from . import __version__
 from .db import open_session
-from .filters import FilterError, compile_filter, split_matcher
+from .filters import SPEC, FilterError, heavy as _heavy_q, help_text, split_matcher
 from .identity import SESSION, AuthError, check_token
-from .mcp import PARSE_ERROR, McpServer, rpc_error
+from .mcp import NO_BATCHES_FROM, PARSE_ERROR, PROTOCOL_VERSIONS, McpServer, rpc_error
+from .mcp_tools import Ctx, ToolError
+from .notes import NoteDenied, NoteError
+from .repeater import Busy, Conflict, RepeatError
 from .queries import DB, Forbidden, Queries
 
 log = logging.getLogger("m2c.api")
@@ -42,6 +47,8 @@ log = logging.getLogger("m2c.api")
 DB_TAILS_PER_SCOPE = 2
 DB_TAILS_ADMIN = 4
 DB_TAILS_TOTAL = 8
+CACHE_TTL = 5  # s
+CACHE_MAX = 512
 U64_MAX = (1 << 64) - 1  # chDB wraps an out-of-range parameter instead of rejecting it: bound them here
 
 
@@ -49,8 +56,11 @@ class ClientGone(Exception):
     """The client disconnected before its query started."""
 
 
-def _heavy_q(q: str) -> bool:
-    return "body:" in (q or "").lower()
+def _matches(pred, item) -> bool:
+    try:
+        return bool(pred(item))
+    except Exception:  # noqa: BLE001 - as in the live feed: a predicate that fails on an odd summary skips it
+        return False
 
 
 def _loopback(host: str) -> bool:
@@ -79,6 +89,7 @@ class Api:
         self.scoped_share = max(1, readers - heavy - 1)  # interactive queries in flight per session-scoped token
         self._limits: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
         self.db_tails: dict[str | None, int] = {}
+        self.cache: dict[tuple, tuple[float, object]] = {}  # facets and suggestions, typed fast and asked often
         self.server: tornado.httpserver.HTTPServer | None = None
         self.info_path = st.config.data / "api.json"
         self.proxy_addr = ""
@@ -147,18 +158,34 @@ class Api:
                 (r"/healthz", Health, {"api": self}),
                 (r"/v1/scan", ScanHandler, {"api": self}),
                 (r"/v1/sessions", SessionsHandler, {"api": self}),
+                (r"/v1/filter-help", FilterHelpHandler, {"api": self}),
+                (r"/v1/report", ReportHandler, {"api": self}),
+                (r"/v1/facets", FacetsHandler, {"api": self}),
+                (r"/v1/suggest", SuggestHandler, {"api": self}),
+                (r"/v1/grep", GrepHandler, {"api": self}),
+                (r"/v1/diff", DiffHandler, {"api": self}),
                 (r"/v1/flows", FlowsHandler, {"api": self}),
                 (r"/v1/flows/(\d+)", FlowHandler, {"api": self}),
                 (r"/v1/flows/(\d+)/body/(req|resp)", BodyHandler, {"api": self}),
                 (r"/v1/flows/(\d+)/(sse|ws|grpc)", ChildrenHandler, {"api": self}),
                 (r"/v1/flows/(\d+)/curl", CurlHandler, {"api": self}),
+                (r"/v1/flows/(\d+)/export", ExportHandler, {"api": self}),
+                (r"/v1/filter-check", FilterCheckHandler, {"api": self}),
                 (r"/v1/flows/(\d+)/live", FlowLiveHandler, {"api": self}),
                 (r"/v1/tail", TailHandler, {"api": self}),
                 (r"/v1/har", HarHandler, {"api": self}),
                 (r"/v1/events", EventsHandler, {"api": self}),
-                (r"/v1/sql", SqlHandler, {"api": self}),
+                (r"/v1/notes", NotesHandler, {"api": self}),
+                (r"/v1/timeline/sessions", TimelineSessionsHandler, {"api": self}),
+                (r"/v1/timeline", TimelineHandler, {"api": self}),
+                (r"/v1/notes/([0-9a-fA-F-]{36})", NoteHandler, {"api": self}),
+                (r"/v1/flows/(\d+)/notes", FlowNotesHandler, {"api": self}),
+                (r"/v1/flows/(\d+)/resend", ResendHandler, {"api": self}),
+                (r"/v1/events/counts", EventCountsHandler, {"api": self}),
+                (r"/v1/activity", ActivityHandler, {"api": self}),
                 (r"/mcp", McpHandler, {"api": self}),
-                (r"/ui/?", UiHandler, {"api": self}),
+                (r"/ui", tornado.web.RedirectHandler, {"url": "/ui/"}),
+                (r"/ui/(.*)", UiStatic, {"api": self, "path": str(resources.files("m2c").joinpath("ui")), "default_filename": "index.html"}),
                 (r"/", tornado.web.RedirectHandler, {"url": "/ui/"}),
             ],
             compress_response=True,
@@ -272,8 +299,28 @@ class Base(tornado.web.RequestHandler):
             raise tornado.web.HTTPError(400, str(e)) from None
         except Forbidden as e:
             raise tornado.web.HTTPError(403, str(e)) from None
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:  # engine errors (a bad regex, ...) and bad argument values
             raise tornado.web.HTTPError(400, str(e).strip()[:2000]) from None
+
+    async def cached(self, key: tuple, fn, *args, heavy: bool = False):
+        """`fn(*args)` on a reader, remembered for CACHE_TTL seconds per caller scope, or until the writer stores rows."""
+        key = (self.scope, sum(self.api.st.writer.counters.written.values()), *key)
+        hit = self.api.cache.get(key)
+        if hit is not None and time.monotonic() - hit[0] < CACHE_TTL:
+            return hit[1]
+        value = await self.call(fn, *args, heavy=heavy)
+        if len(self.api.cache) >= CACHE_MAX:
+            self.api.cache.clear()
+        self.api.cache[key] = (time.monotonic(), value)
+        return value
+
+    def bool_arg(self, name: str, default: bool) -> bool:
+        value = self.get_argument(name, None)
+        if value in (None, ""):
+            return default
+        if value.lower() not in ("1", "0", "true", "false"):
+            raise tornado.web.HTTPError(400, f"{name} is 1 or 0")
+        return value.lower() in ("1", "true")
 
     def int_arg(self, name: str, default: int | None = None, hi: int = U64_MAX) -> int | None:
         value = self.get_argument(name, None)
@@ -306,7 +353,8 @@ class ScanHandler(Base):
     async def get(self):
         stats = await self.call(self.q.stats)
         st = self.api.st
-        stats.update(scan_id=st.config.scan_id, version=__version__, uptime_s=int(time.time() - self.api.started), scope=self.scope)
+        stats.update(scan_id=st.config.scan_id, version=__version__, uptime_s=int(time.time() - self.api.started), scope=self.scope,
+                     repeater=st.repeater.allowed(self.admin))
         if self.scope is None:  # process-wide counters: a scoped caller sees its own session's totals only
             stats.update(live_ring=len(st.live.ring), last_n=max(stats.get("last_n") or 0, st.last_n()))
         if self.admin:
@@ -329,6 +377,57 @@ class FlowsHandler(Base):
             raise tornado.web.HTTPError(400, "order is asc or desc")
         q = self.get_argument("q", "")
         self.send_json(await self.call(self.q.flows, q, self.int_arg("limit", 100), self.int_arg("cursor"), order, heavy=_heavy_q(q)))
+
+
+class FilterHelpHandler(Base):
+    async def get(self):
+        # each key's facet is a SQL expression: clients only learn that the key has suggestible values
+        keys = [{**{k: v for k, v in s.items() if k != "facet"}, "facets": "facet" in s} for s in SPEC]
+        self.send_json({"keys": keys, "text": help_text()})
+
+
+class FacetsHandler(Base):
+    async def get(self):
+        key, prefix, q = self.get_argument("key", ""), self.get_argument("prefix", ""), self.get_argument("q", "")
+        limit = self.int_arg("limit", 20)
+        self.send_json(await self.cached(("facets", key, prefix, q, limit), self.q.facets, key, prefix, q, limit, heavy=_heavy_q(q)))
+
+
+class SuggestHandler(Base):
+    async def get(self):
+        q = self.get_argument("q", "")
+        try:
+            pred, _ = split_matcher(q, self.scope)
+        except FilterError as e:
+            raise tornado.web.HTTPError(400, str(e)) from None
+        live = self.api.st.live
+        open_flows = sum(1 for f in list(live.open.values()) if _matches(pred, f))
+        self.send_json(await self.cached(("suggest", q, open_flows), self.q.suggest, q, open_flows, heavy=_heavy_q(q)))
+
+
+class ReportHandler(Base):
+    async def get(self):
+        self.send_json(await self.call(self.q.report, self.get_argument("q", ""), self.get_argument("by", "tool"),
+                                       self.int_arg("limit", 50), heavy=True))
+
+
+class GrepHandler(Base):
+    async def get(self):
+        self.send_json(await self.call(
+            self.q.grep, self.get_argument("pattern", ""), self.bool_arg("regex", False), self.bool_arg("ci", True),
+            self.get_argument("side", "both"), self.get_argument("q", ""), self.get_argument("in", "body"),
+            self.int_arg("context", 80), self.int_arg("limit", 20), self.int_arg("per_flow", 3), heavy=True))
+
+
+class DiffHandler(Base):
+    async def get(self):
+        a, b = self.int_arg("a"), self.int_arg("b")
+        if a is None or b is None:
+            raise tornado.web.HTTPError(400, "a and b are flow numbers")
+        out = await self.call(self.q.diff, a, b, 256 << 10, self.bool_arg("redact", True), heavy=True)
+        if out is None:
+            raise tornado.web.HTTPError(404, f"no flow #{a} or #{b}")
+        self.send_json(out)
 
 
 class FlowHandler(Base):
@@ -368,6 +467,27 @@ class ChildrenHandler(Base):
         self.send_json(await self.call(fn, *args))
 
 
+class ExportHandler(Base):
+    async def get(self, n):
+        fmt = self.get_argument("format", "curl")
+        out = await self.call(self.q.export, self.flow_n(n), fmt)
+        if out is None:
+            raise tornado.web.HTTPError(404, f"no flow #{n}")
+        self.set_header("Content-Type", "application/json" if fmt == "har" else "text/plain; charset=utf-8")
+        self.finish(out + ("" if out.endswith("\n") else "\n"))
+
+
+class FilterCheckHandler(Base):
+    """Whether a query parses, without touching the database: the UI checks before it applies one."""
+
+    def get(self):
+        try:
+            _, exact = split_matcher(self.get_argument("q", ""), self.scope)
+        except FilterError as e:
+            raise tornado.web.HTTPError(400, str(e)) from None
+        self.send_json({"ok": True, "live": exact})
+
+
 class CurlHandler(Base):
     async def get(self, n):
         cmd = await self.call(self.q.curl, self.flow_n(n))
@@ -383,22 +503,146 @@ class HarHandler(Base):
         self.send_json(await self.call(self.q.har, self.get_argument("q", ""), self.int_arg("limit", 1000), heavy=True))
 
 
+NS_MAX = 2000
+
+
+class NoteBase(Base):
+    def json_body(self) -> dict:
+        try:
+            body = json.loads(self.request.body or b"{}")
+        except ValueError:
+            raise tornado.web.HTTPError(400, "the body is not JSON") from None
+        if not isinstance(body, dict):
+            raise tornado.web.HTTPError(400, "the body is a JSON object")
+        return body
+
+    def write_note(self, fn, *args):
+        try:
+            return fn(*args, self.admin, self.scope)
+        except NoteError as e:
+            raise tornado.web.HTTPError(400, str(e)) from None
+        except NoteDenied as e:
+            raise tornado.web.HTTPError(403, str(e)) from None
+        except RuntimeError as e:
+            raise tornado.web.HTTPError(503, str(e)) from None
+
+    def mine(self, note: dict) -> bool:
+        return self.scope is None or note["session"] == self.scope
+
+
+class NotesHandler(NoteBase):
+    """GET /v1/notes?ns=1,2,3 (the notes on those flows) or ?q= (on the flows a filter matches)."""
+
+    async def get(self):
+        raw = self.get_argument("ns", None)
+        ns = None
+        if raw is not None:
+            parts = [p for p in raw.split(",") if p]
+            if len(parts) > NS_MAX or not all(p.isascii() and p.isdigit() and len(p) <= 20 for p in parts):
+                raise tornado.web.HTTPError(400, f"ns: up to {NS_MAX} flow numbers, comma-separated")
+            ns = [int(p) for p in parts]
+        q = self.get_argument("q", "")
+        notes = self.api.st.notes
+        stored = await self.call(self.q.notes, ns, q, None, self.int_arg("limit", 1000), heavy=_heavy_q(q))
+        wanted = set(ns or ())
+        if ns is None and q:  # a note written a moment ago may not be stored yet: does its flow match q?
+            fresh = sorted({v["n"] for _, v in notes.pending.values()} - {x["n"] for x in stored})
+            hits = await self.call(self.q.hits, q, fresh, heavy=True) if fresh else {}
+            wanted = {x["n"] for x in stored} | {n for n, hit in hits.items() if hit}
+        keep = lambda v: self.mine(v) and (v["n"] in wanted if (ns is not None or q) else True)  # noqa: E731
+        self.send_json(notes.merge(stored, keep))
+
+
+class FlowNotesHandler(NoteBase):
+    async def get(self, n):
+        n = self.flow_n(n)
+        stored = await self.call(self.q.notes, [n])
+        self.send_json(self.api.st.notes.merge(stored, lambda v: v["n"] == n and self.mine(v)))
+
+    async def post(self, n):
+        body = self.json_body()
+        flow = await self.call(self.q.flow, self.flow_n(n))
+        if flow is None:
+            raise tornado.web.HTTPError(404, f"no flow #{n}")
+        self.set_status(201)
+        self.send_json(self.write_note(self.api.st.notes.add, flow, body))
+
+
+class NoteHandler(NoteBase):
+    async def current(self, nid: str) -> dict:
+        nid = nid.lower()
+        stored = await self.call(self.q.notes, None, "", nid)
+        found = [v for v in self.api.st.notes.merge(stored, lambda v: v["id"] == nid and self.mine(v)) if v["id"] == nid]
+        if not found:
+            raise tornado.web.HTTPError(404, f"no note {nid}")
+        return found[0]
+
+    async def patch(self, nid):
+        body = self.json_body()
+        self.send_json(self.write_note(self.api.st.notes.change, await self.current(nid), body))
+
+    async def delete(self, nid):
+        self.write_note(self.api.st.notes.change, await self.current(nid), None)
+        self.set_status(204)
+        self.finish()
+
+
+class TimelineSessionsHandler(Base):
+    """The sessions whose flows carry tool call ids (the timeline's session list)."""
+
+    async def get(self):
+        self.send_json(await self.call(self.q.call_sessions))
+
+
+class TimelineHandler(Base):
+    async def get(self):
+        session = self.get_argument("session", "") or (self.scope or "")
+        if not SESSION.fullmatch(session):
+            raise tornado.web.HTTPError(400, "session: which session's timeline")
+        self.send_json(await self.call(self.q.timeline, session, self.int_arg("limit", 2000), heavy=True))
+
+
+class ResendHandler(NoteBase):
+    """POST {method?, url?, headers?, headers_remove?, body? | body_base64?}: resend flow N through the proxy."""
+
+    async def post(self, n):
+        body = self.json_body()
+        db = lambda fn, *args, heavy=False: self.api.run(fn, *args, heavy=heavy, scope=self.scope, gone=None)  # noqa: E731
+        try:
+            out = await self.api.st.repeater.resend(db, self.q, self.flow_n(n), body, self.admin, self.scope)
+        except RepeatError as e:
+            raise tornado.web.HTTPError(400, str(e)) from None
+        except NoteDenied as e:
+            raise tornado.web.HTTPError(403, str(e)) from None
+        except LookupError as e:
+            raise tornado.web.HTTPError(404, str(e)) from None
+        except Conflict as e:
+            raise tornado.web.HTTPError(409, str(e)) from None
+        except Busy as e:
+            raise tornado.web.HTTPError(429, str(e)) from None
+        self.set_status(201)
+        self.send_json(out)
+
+
 class EventsHandler(Base):
     async def get(self):
-        self.send_json(await self.call(self.q.events, self.get_argument("kind", ""), self.int_arg("limit", 100)))
+        severity = self.get_argument("severity", "")
+        if severity not in ("", "debug", "info", "warn", "error"):
+            raise tornado.web.HTTPError(400, "severity is debug, info, warn or error")
+        self.send_json(await self.call(self.q.events, self.get_argument("kind", ""), self.int_arg("limit", 100), severity))
 
 
-class SqlHandler(Base):
-    async def post(self):
-        if not self.admin:
-            raise tornado.web.HTTPError(403, "SQL needs the admin token")
-        sql = self.request.body.decode("utf-8", "replace").strip()
-        fmt = self.get_argument("format", "JSONEachRow")
-        if not fmt.replace("_", "").isalnum():
-            raise tornado.web.HTTPError(400, "bad format")
-        out = await self.call(self.q.sql, sql, fmt, heavy=True)
-        self.set_header("Content-Type", "application/json" if fmt.startswith("JSON") else "application/octet-stream")
-        self.finish(out)
+class EventCountsHandler(Base):
+    async def get(self):
+        since = self.int_arg("since", 0, hi=(1 << 62))
+        self.send_json(await self.cached(("event-counts", since), self.q.event_counts, since))
+
+
+class ActivityHandler(Base):
+    async def get(self):
+        q = self.get_argument("q", "")
+        buckets = self.int_arg("buckets", 24)
+        self.send_json(await self.cached(("activity", q, buckets), self.q.activity, q, buckets, heavy=_heavy_q(q)))
 
 
 def live_stats(api: Api, scope: str | None) -> dict:
@@ -408,18 +652,6 @@ def live_stats(api: Api, scope: str | None) -> dict:
         c = st.writer.counters
         out.update(last_n=st.last_n(), queued=c.queued, written=sum(c.written.values()), dropped=sum(c.dropped.values()), errors=c.hook_errors + c.tee_errors + c.insert_errors)
     return out
-
-
-def tail_hits(q: Queries, flt: str, ns: list[int]) -> dict[int, bool]:
-    """For those of `ns` that are in the database: whether they match filter `flt`. Missing ones are not written yet."""
-    where, params = compile_filter(flt, q.scope)
-    params["tail_ns"] = ns
-    pin = ""
-    if q.scope is not None:
-        pin = " AND session = {tail_scope:String}"
-        params["tail_scope"] = q.scope
-    rows = q.rows(f"SELECT n, max(toUInt8({where})) AS hit FROM {DB}.http_flows WHERE n IN {{tail_ns:Array(UInt64)}}{pin} GROUP BY n", params)
-    return {int(r["n"]): bool(r["hit"]) for r in rows}
 
 
 class SseStream(Base):
@@ -443,12 +675,6 @@ class TailHandler(SseStream):
 
     PENDING_TTL = 600  # s: a flow not in the database by then was dropped by the writer
     CHECK_BATCH = 1000
-
-    def _match(self, pred, item) -> bool:
-        try:
-            return bool(pred(item))
-        except Exception:  # noqa: BLE001 - same as LiveFeed: a bad predicate skips the flow
-            return False
 
     def _resume(self, live):
         """The cursor to replay from, "resync" when the client's cursor is no use here, or None (a fresh tail)."""
@@ -494,13 +720,13 @@ class TailHandler(SseStream):
             if missed:
                 self._resync("behind", missed)
             for seq, item in items:
-                if self._match(pred, item):
+                if _matches(pred, item):
                     self.send_event("flow", item, f"{live.epoch}.{seq}")
         elif backlog:
             for seq, item in live.recent(pred, backlog):
                 self.send_event("flow", item, f"{live.epoch}.{seq}")
         for item in list(live.open.values()):
-            if self._match(pred, item):
+            if _matches(pred, item):
                 self.send_event("open", item)
         self.send_event("stats", live_stats(self.api, self.scope), f"{live.epoch}.{cursor}")
         await self.flush()
@@ -514,14 +740,14 @@ class TailHandler(SseStream):
                     self.send_event(kind, item)
             if lost_opens:  # the queue overflowed: send the open flows again, the client dedupes by n
                 for item in list(live.open.values()):
-                    if self._match(pred, item):
+                    if _matches(pred, item):
                         self.send_event("open", item)
             items, missed = live.since(cursor)
             cursor = live.seq
             if missed:
                 self._resync("behind", missed)
             for seq, item in items:
-                if self._match(pred, item):
+                if _matches(pred, item):
                     self.send_event("flow", item, f"{live.epoch}.{seq}")
             if time.monotonic() >= next_stats:
                 next_stats = time.monotonic() + 2
@@ -539,7 +765,7 @@ class TailHandler(SseStream):
 
         def add(items):
             for seq, item in items:
-                if item["n"] not in sent and self._match(pred, item):
+                if item["n"] not in sent and _matches(pred, item):
                     pending[item["n"]] = (seq, item, time.monotonic())
 
         def event_id():
@@ -587,7 +813,7 @@ class TailHandler(SseStream):
             if pending and now >= next_check:
                 batch = sorted(pending)[: self.CHECK_BATCH]
                 try:
-                    hits = await self.call(tail_hits, self.q, q, batch, heavy=True)
+                    hits = await self.call(self.q.hits, q, batch, heavy=True)
                     took = time.monotonic() - now
                 except tornado.web.HTTPError as e:  # e.g. the memory limit: keep the stream, try again later
                     self.send_event("error", {"error": e.log_message})
@@ -701,7 +927,36 @@ class McpHandler(Base):
     def check_xsrf_cookie(self):
         pass
 
+    def _origin_ok(self) -> bool:
+        """A browser page on another origin must not drive the MCP endpoint (DNS rebinding, CSRF): Streamable HTTP
+        servers check Origin. Clients that aren't browsers send none."""
+        origin = self.request.headers.get("Origin")
+        if origin is None:
+            return True
+        netloc = urllib.parse.urlsplit(origin).netloc
+        return bool(netloc) and self.api.host_ok(netloc)
+
+    async def _db(self, fn, *args, heavy: bool = False):
+        # not self.call: the tools report filter, permission and engine errors to the agent as tool results
+        return await self.api.run(fn, *args, heavy=heavy, scope=self.scope, gone=lambda: self.gone)
+
+    async def _resend(self, n: int, overrides: dict) -> dict:
+        db = lambda fn, *args, heavy=False: self.api.run(fn, *args, heavy=heavy, scope=self.scope, gone=None)  # noqa: E731
+        return await self.api.st.repeater.resend(db, self.q, n, overrides, self.admin, self.scope)
+
+    def _claim_db_tail(self):
+        try:
+            self.api.db_tail_slot(self.scope)
+        except tornado.web.HTTPError as e:
+            raise ToolError(e.log_message) from None
+
     async def post(self):
+        if not self._origin_ok():
+            raise tornado.web.HTTPError(403, "cross-origin MCP requests are not allowed")
+        version = self.request.headers.get("MCP-Protocol-Version")
+        if version is not None and version not in PROTOCOL_VERSIONS:
+            self.set_status(400)
+            return self.send_json(rpc_error(None, -32600, f"unsupported MCP-Protocol-Version {version[:40]!r}"))
         try:
             msg = json.loads(self.request.body or b"{}")
         except ValueError:  # bad JSON, or bytes that are not UTF-8
@@ -710,13 +965,17 @@ class McpHandler(Base):
         if msg == []:
             self.set_status(400)
             return self.send_json(rpc_error(None, -32600, "invalid request: empty batch"))
-        server = McpServer(self.q, self.admin)
-        msgs = msg if isinstance(msg, list) else [msg]
+        if isinstance(msg, list) and version is not None and version >= NO_BATCHES_FROM:
+            self.set_status(400)
+            return self.send_json(rpc_error(None, -32600, f"MCP {version} has no JSON-RPC batches: send one message per request"))
+        st = self.api.st
+        ctx = Ctx(self.q, self.admin, self._db, live=st.live, db_tail=(self._claim_db_tail, lambda: self.api.db_tail_release(self.scope)),
+                  gone=lambda: self.gone, notes=st.notes,
+                  resend=self._resend if st.repeater.allowed(self.admin) else None)
+        server = McpServer(self.q, self.admin, ctx)
         replies = []
-        for m in msgs:
-            params = m.get("params") if isinstance(m, dict) else None
-            heavy = isinstance(params, dict) and (params.get("name") == "traffic_sql" or _heavy_q(json.dumps(params.get("arguments"))))
-            reply = await self.call(server.handle, m, heavy=heavy)
+        for m in msg if isinstance(msg, list) else [msg]:
+            reply = await server.handle(m)  # on the event loop: database reads go to the reader lanes through ctx.db
             if reply is not None:
                 replies.append(reply)
         if not replies:
@@ -728,18 +987,41 @@ class McpHandler(Base):
         raise tornado.web.HTTPError(405, "this MCP endpoint has no server-initiated stream")
 
 
-class UiHandler(Base):
-    public = True
+UI_CSP = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'; "
+    "require-trusted-types-for 'script'; trusted-types 'none'"
+)
+UI_TYPES = {".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+            ".html": "text/html; charset=utf-8", ".json": "application/json", ".svg": "image/svg+xml"}
 
-    def get(self):
+
+class UiStatic(tornado.web.StaticFileHandler):
+    """The web UI's files. No inline script or style anywhere: the CSP allows only files from here. Always
+    revalidated (ETag), so an upgraded proxy never serves a stale mix of modules."""
+
+    def initialize(self, api: Api, path: str, default_filename: str | None = None):
+        super().initialize(path, default_filename)
+        self.api = api
+
+    def prepare(self):
+        if not self.api.host_ok(self.request.host or ""):
+            raise tornado.web.HTTPError(421, "host not allowed")
         if not self.api.ui:
             raise tornado.web.HTTPError(404, "the web UI is off (m2c_ui=false)")
-        page = resources.files("m2c").joinpath("ui/index.html").read_bytes()
-        self.set_header("Content-Type", "text/html; charset=utf-8")
-        self.set_header(
-            "Content-Security-Policy",
-            "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'",
-        )
-        self.set_header("Referrer-Policy", "no-referrer")
-        self.finish(page)
 
+    def compute_etag(self) -> str | None:
+        # tornado caches a content hash per path for the process's life: an edited file would keep its old ETag
+        if not self.absolute_path:
+            return None
+        st = os.stat(self.absolute_path)
+        return f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+
+    def get_content_type(self) -> str:
+        return UI_TYPES.get(os.path.splitext(self.absolute_path or "")[1], "application/octet-stream")
+
+    def set_extra_headers(self, path):
+        self.set_header("Cache-Control", "no-cache")
+        self.set_header("X-Content-Type-Options", "nosniff")
+        self.set_header("Referrer-Policy", "no-referrer")
+        self.set_header("Content-Security-Policy", UI_CSP)

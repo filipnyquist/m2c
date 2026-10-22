@@ -1,129 +1,42 @@
-"""MCP server logic (JSON-RPC 2.0), transport-free: the API serves it at POST /mcp, `m2c mcp` over stdio.
+"""MCP server (JSON-RPC 2.0), transport-free: the API serves it at POST /mcp, `m2c mcp` over stdio.
 
-Outputs are bounded so an agent's context doesn't fill up: lists are summaries, bodies are cut at `max_bytes`
-(8 KiB by default) with a note on how to get more.
+The protocol lives here; the tools, resources and prompts in mcp_tools.py. Handling is async: under the live API it
+runs on the event loop (database reads go to reader threads through the context), offline `handle_sync` runs it.
 """
 
 from __future__ import annotations
 
-import base64
+import asyncio
 import json
 from collections.abc import Callable
 
 from . import __version__
-from .filters import FilterError
+from .filters import FilterError, help_text
+from .mcp_tools import PROMPTS, RESOURCE_TEMPLATES, RESOURCES, Ctx, NotFound, ToolError, get_prompt, read_resource, tools
 from .queries import Forbidden, Queries
 
-PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
-FILTER_HELP = (
-    "Filter syntax (terms are ANDed, `|` ORs values, `-` negates): session:<id> tool:<name> call:<id> tag:<t> "
-    "host:*.example.com method:POST status:5xx|404|>=400 path:/api/* url:<text> ct:json ua:curl has:sse|ws|error|body "
-    "err:timeout after:10m before:2026-10-21T12:00 n:100-200 body:\"needle\" and free text (matches the URL)."
+PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+NO_BATCHES_FROM = "2025-06-18"  # JSON-RPC batching was removed from MCP in this version
+FILTER_HELP = help_text()
+TOOLS = tools(FILTER_HELP)
+INSTRUCTIONS = (
+    "Recorded proxy traffic of AI agent runs. After making a request, traffic_wait returns it once it finishes; "
+    "traffic_search lists flows one line each; traffic_get shows one in full; traffic_events shows auth and TLS failures "
+    "that never became flows. " + FILTER_HELP
 )
-TEXTY = ("text/", "application/json", "application/xml", "application/javascript", "application/x-www-form-urlencoded", "+json", "+xml", "ndjson", "event-stream", "graphql")
-
-
-def _schema(props: dict, required=()) -> dict:
-    return {"type": "object", "properties": props, "required": list(required), "additionalProperties": False}
-
-
-N = {"type": "integer", "description": "Flow number (#n) from traffic_search"}
-
-TOOLS = [
-    {
-        "name": "traffic_stats",
-        "description": "Totals for the recorded scan: flows, sessions, tools, hosts, errors, SSE events, WebSocket messages.",
-        "inputSchema": _schema({}),
-    },
-    {
-        "name": "traffic_sessions",
-        "description": "Per session and tool: flows, failures, hosts, bytes, first and last seen. " + FILTER_HELP,
-        "inputSchema": _schema({"query": {"type": "string", "description": "Optional filter"}}),
-    },
-    {
-        "name": "traffic_search",
-        "description": "List recorded HTTP flows (newest first) as summaries without bodies. " + FILTER_HELP,
-        "inputSchema": _schema(
-            {
-                "query": {"type": "string", "description": "Filter, e.g. 'tool:curl status:5xx host:*.example.com'"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
-                "cursor": {"type": "integer", "description": "`next` from the previous page"},
-            }
-        ),
-    },
-    {
-        "name": "traffic_get",
-        "description": "One flow in full: request and response headers, bodies (cut at max_bytes), timings, TLS, identity, error.",
-        "inputSchema": _schema(
-            {
-                "n": N,
-                "include_bodies": {"type": "boolean", "default": True},
-                "max_bytes": {"type": "integer", "minimum": 0, "maximum": 1048576, "default": 8192},
-            },
-            ["n"],
-        ),
-    },
-    {
-        "name": "traffic_sse",
-        "description": "Server-Sent Events of one streamed response, in order.",
-        "inputSchema": _schema({"n": N, "after": {"type": "integer", "default": 0}, "limit": {"type": "integer", "default": 100}}, ["n"]),
-    },
-    {
-        "name": "traffic_ws",
-        "description": "WebSocket messages of one connection, in order (from_client tells the direction).",
-        "inputSchema": _schema({"n": N, "after": {"type": "integer", "default": 0}, "limit": {"type": "integer", "default": 100}}, ["n"]),
-    },
-    {
-        "name": "traffic_grpc",
-        "description": (
-            "Messages of one gRPC call in order, both directions (from_client tells which), each decoded from protobuf "
-            "(field names when the proxy has a .proto file, else field numbers). Calls have grpc_service, grpc_method and "
-            "grpc_status (0 = OK) in traffic_get; find them with traffic_search query 'has:grpc' or 'gstatus:!0'."
-        ),
-        "inputSchema": _schema({"n": N, "after": {"type": "integer", "default": 0}, "limit": {"type": "integer", "default": 50}}, ["n"]),
-    },
-    {
-        "name": "traffic_curl",
-        "description": "A curl command that replays the request of one flow (proxy credentials are not included).",
-        "inputSchema": _schema({"n": N}, ["n"]),
-    },
-]
-SQL_TOOL = {
-    "name": "traffic_sql",
-    "description": (
-        "Read-only ClickHouse SQL over the scan. Tables: m2c.http_flows (one row per HTTP flow; bodies in req_body/resp_body), "
-        "m2c.sse_events, m2c.ws_messages (joined on n), m2c.proxy_events (auth failures, TLS failures, health). "
-        "Results are JSON lines, cut at 64 KiB; add LIMIT."
-    ),
-    "inputSchema": _schema({"sql": {"type": "string"}}, ["sql"]),
-}
-
-
-def _text_body(data: bytes, ctype: str, max_bytes: int, stored: int, total: int) -> dict:
-    shown = data[:max_bytes]
-    out: dict = {"stored_bytes": stored, "wire_bytes": total}
-    is_text = any(t in (ctype or "").lower() for t in TEXTY)
-    try:
-        out["text"] = shown.decode("utf-8")
-    except UnicodeDecodeError:
-        if is_text:
-            out["text"] = shown.decode("utf-8", "replace")
-        else:
-            out["base64"] = base64.b64encode(shown).decode()
-    if stored > len(shown):
-        out["cut"] = f"showing {len(shown)} of {stored} stored bytes; call traffic_get with a larger max_bytes for more"
-    return out
 
 
 class McpServer:
-    def __init__(self, queries: Queries, admin: bool):
+    def __init__(self, queries: Queries, admin: bool, ctx: Ctx | None = None):
         self.q = queries
         self.admin = admin
+        self.ctx = ctx or Ctx(queries, admin)
+        self._tools = {t.name: t for t in TOOLS if not t.needs_resend or self.ctx.resend is not None}
 
     def tools(self) -> list[dict]:
-        return TOOLS + ([SQL_TOOL] if self.admin else [])
+        return [t.spec() for t in self._tools.values()]
 
-    def handle(self, msg) -> dict | None:
+    async def handle(self, msg) -> dict | None:
         """One JSON-RPC message in, the response (or None for a notification) out. Never raises: a malformed message
         or a failing tool is an error reply, so one bad call cannot fail a batch or end the stdio server."""
         if not isinstance(msg, dict):
@@ -138,94 +51,92 @@ class McpServer:
         if not isinstance(params, dict):
             return rpc_error(mid, -32602, "params must be an object")
         try:
-            result = self._dispatch(method, params)
+            result = await self._dispatch(method, params)
         except _RpcError as e:
             return rpc_error(mid, e.code, str(e))
         except Exception as e:  # noqa: BLE001 - reported to the caller, see above
             return rpc_error(mid, -32603, f"internal error: {e}")
         return {"jsonrpc": "2.0", "id": mid, "result": result}
 
-    def handle_payload(self, msg) -> dict | list | None:
+    async def handle_payload(self, msg) -> dict | list | None:
         """A parsed message or batch in; the reply (an object, a list, or None when there is nothing to answer) out."""
         if isinstance(msg, list):
             if not msg:
                 return rpc_error(None, -32600, "invalid request: empty batch")
-            replies = [r for r in map(self.handle, msg) if r is not None]
+            replies = [r for r in [await self.handle(m) for m in msg] if r is not None]
             return replies or None
-        return self.handle(msg)
+        return await self.handle(msg)
 
-    def _dispatch(self, method: str, params: dict):
+    def handle_sync(self, msg) -> dict | list | None:
+        return asyncio.run(self.handle_payload(msg))
+
+    async def _dispatch(self, method: str, params: dict):
         if method == "initialize":
             asked = params.get("protocolVersion")
             return {
                 "protocolVersion": asked if asked in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
-                "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "m2c", "version": __version__},
-                "instructions": "Recorded proxy traffic of AI agent runs. Start with traffic_stats or traffic_search; "
-                "fetch details with traffic_get. " + FILTER_HELP,
+                "capabilities": {"tools": {"listChanged": False}, "resources": {"listChanged": False}, "prompts": {"listChanged": False}},
+                "serverInfo": {"name": "m2c", "title": "m2c proxy traffic", "version": __version__},
+                "instructions": INSTRUCTIONS,
             }
         if method == "ping":
             return {}
         if method == "tools/list":
             return {"tools": self.tools()}
         if method == "tools/call":
-            name = params.get("name", "")
+            return await self._call(params)
+        if method == "resources/list":
+            return {"resources": RESOURCES}
+        if method == "resources/templates/list":
+            return {"resourceTemplates": RESOURCE_TEMPLATES}
+        if method == "resources/read":
+            uri = params.get("uri")
+            if not isinstance(uri, str):
+                raise _RpcError(-32602, "uri must be a string")
+            try:
+                return {"contents": [await read_resource(self.ctx, uri)]}
+            except NotFound:
+                raise _RpcError(-32002, f"resource not found: {uri}") from None
+        if method == "prompts/list":
+            return {"prompts": PROMPTS}
+        if method == "prompts/get":
             args = params.get("arguments") or {}
-            if not isinstance(name, str) or name not in {t["name"] for t in self.tools()}:
-                raise _RpcError(-32602, f"unknown tool {name}")
             if not isinstance(args, dict):
                 raise _RpcError(-32602, "arguments must be an object")
             try:
-                value = self.call(name, args)
-            except (FilterError, Forbidden, ValueError, RuntimeError) as e:
-                return {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True}
-            except KeyError as e:
-                return {"content": [{"type": "text", "text": f"error: missing argument {e}"}], "isError": True}
-            except Exception as e:  # noqa: BLE001 - bad argument types (TypeError), engine errors, ...: the agent sees them
-                return {"content": [{"type": "text", "text": f"error: {type(e).__name__}: {e}"}], "isError": True}
-            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
-            return {"content": [{"type": "text", "text": text}], "isError": False}
+                return get_prompt(params.get("name"), args)
+            except NotFound:
+                raise _RpcError(-32602, f"unknown prompt {params.get('name')}") from None
+            except ToolError as e:
+                raise _RpcError(-32602, str(e)) from None
         raise _RpcError(-32601, f"method not found: {method}")
 
-    def call(self, name: str, a: dict):
-        q = self.q
-        if name == "traffic_stats":
-            return q.stats()
-        if name == "traffic_sessions":
-            return q.sessions(a.get("query", ""))
-        if name == "traffic_search":
-            return q.flows(a.get("query", ""), limit=min(int(a.get("limit", 50)), 500), cursor=a.get("cursor"))
-        if name == "traffic_get":
-            flow = q.flow(int(a["n"]))
-            if flow is None:
-                return f"no flow #{a['n']}"
-            if a.get("include_bodies", True):
-                max_bytes = int(a.get("max_bytes", 8192))
-                for side in ("req", "resp"):
-                    if flow[f"{side}_body_stored"]:
-                        body = q.body(flow["n"], side, max_bytes=max_bytes + 1)
-                        ctype = flow["resp_content_type"] if side == "resp" else ""
-                        flow[f"{side}_body"] = _text_body(body[0], ctype or body[1], max_bytes, flow[f"{side}_body_stored"], flow[f"{side}_body_size"])
-            return flow
-        if name == "traffic_sse":
-            return q.sse(int(a["n"]), int(a.get("after", 0)), min(int(a.get("limit", 100)), 1000))
-        if name == "traffic_ws":
-            return q.ws(int(a["n"]), int(a.get("after", 0)), min(int(a.get("limit", 100)), 1000))
-        if name == "traffic_grpc":
-            out = []
-            for m in q.grpc(int(a["n"]), int(a.get("after", 0)), min(int(a.get("limit", 50)), 500)):
-                if m["decoded"]:
-                    m.pop("base64", None)  # the decoded text says it; keep the context small
-                elif len(m.get("base64", "")) > 2048:
-                    m["base64"], m["cut"] = m["base64"][:2048], "base64 cut at 2 KiB"
-                out.append(m)
-            return out
-        if name == "traffic_curl":
-            return q.curl(int(a["n"])) or f"no flow #{a['n']}"
-        if name == "traffic_sql":
-            raw = q.sql(a["sql"], "JSONEachRow")
-            return raw[:65536].decode("utf-8", "replace") + ("\n... (cut at 64 KiB)" if len(raw) > 65536 else "")
-        raise KeyError(name)
+    async def _call(self, params: dict) -> dict:
+        name = params.get("name", "")
+        args = params.get("arguments") or {}
+        tool = self._tools.get(name) if isinstance(name, str) else None
+        if tool is None:
+            raise _RpcError(-32602, f"unknown tool {name}")
+        if not isinstance(args, dict):
+            raise _RpcError(-32602, "arguments must be an object")
+        try:
+            value = await tool.fn(self.ctx, args)
+        except (ToolError, FilterError, Forbidden, ValueError, RuntimeError) as e:
+            return _error_result(f"error: {e}")
+        except KeyError as e:
+            return _error_result(f"error: missing argument {e}")
+        except Exception as e:  # noqa: BLE001 - bad argument types (TypeError), engine errors, ...: the agent sees them
+            return _error_result(f"error: {type(e).__name__}: {e}")
+        if isinstance(value, str):
+            return {"content": [{"type": "text", "text": value}], "isError": False}
+        out = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, default=str)}], "isError": False}
+        if tool.output_schema and isinstance(value, dict):
+            out["structuredContent"] = json.loads(out["content"][0]["text"])  # the same JSON types as the text
+        return out
+
+
+def _error_result(text: str) -> dict:
+    return {"content": [{"type": "text", "text": text}], "isError": True}
 
 
 class _RpcError(Exception):

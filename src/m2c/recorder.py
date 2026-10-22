@@ -54,6 +54,10 @@ OPTIONS: dict[str, tuple[type, object, str]] = {
     "m2c_api_hosts": (str, "", "Allowed Host headers for the API, comma separated (default: loopback names on a loopback API)"),
     "m2c_readers": (int, 3, "Read-only chDB sessions serving the API"),
     "m2c_ui": (bool, True, "Serve the web UI at /ui/"),
+    "m2c_repeater": (str, "off", "Resend edited requests through the API/UI/MCP: off, admin (the admin token only) or on (also a session "
+                                 "token, for its own session's flows)"),
+    "m2c_repeater_timeout": (int, 30, "Seconds a resent request may take before it is recorded as an error"),
+    "m2c_annotations": (bool, True, "Allow labels and notes on flows through the API (admin, or a session token on its own flows)"),
     "m2c_ring_size": (int, 10_000, "Flow summaries kept in memory for the live tail"),
     "m2c_push_on_exit": (str, "", "Push the scan to this central ClickHouse URL at shutdown (password: M2C_PUSH_PASSWORD)"),
     "m2c_labels": (str, "", "key=value,key=value labels for the central scans row"),
@@ -193,6 +197,8 @@ class Recorder:
         if state.get() is not None:
             return
         opts = ctx.options
+        if opts.m2c_repeater not in ("off", "admin", "on"):
+            raise exceptions.OptionsError("m2c_repeater must be off, admin or on")
         if opts.m2c_auth not in MODES:
             raise exceptions.OptionsError(f"m2c_auth must be one of {', '.join(MODES)}")
         if opts.proxyauth != "any":
@@ -232,6 +238,9 @@ class Recorder:
             api_hosts=opts.m2c_api_hosts,
             readers=opts.m2c_readers,
             ui=opts.m2c_ui,
+            repeater=opts.m2c_repeater,
+            repeater_timeout=max(1, opts.m2c_repeater_timeout),
+            annotations=opts.m2c_annotations,
             ring_size=opts.m2c_ring_size,
             push_on_exit=opts.m2c_push_on_exit,
             fsync=opts.m2c_fsync,
@@ -394,6 +403,8 @@ class Recorder:
                 del headers[name]
         ident = override(ident, tool, call)
         fs = FlowState(ident, flow, n=st.next_n(), tag=tag)
+        if flow.is_replay and isinstance(meta, dict) and isinstance(meta.get("replay_of"), int) and meta["replay_of"] > 0:
+            fs.replay_of = meta["replay_of"]  # set by the repeater; the metadata is rewritten just below
         st.flows[flow.id] = fs
         flow.metadata["m2c"] = _meta(ident, fs.n, tag)
         req = flow.request
@@ -445,7 +456,7 @@ class Recorder:
 
     @staticmethod
     def _publish_open(st, flow: http.HTTPFlow, fs: FlowState, capture: str) -> None:
-        row = rows.http_row(flow, fs.ident, st.config.scan_id, fs.n, fs.tag)
+        row = rows.http_row(flow, fs.ident, st.config.scan_id, fs.n, fs.tag, fs.replay_of)
         if fs.extra.get("grpc"):
             service, method = grpc.service_method(flow.request.path)
             row.update(grpc=True, grpc_service=service, grpc_method=method)
@@ -581,7 +592,7 @@ class Recorder:
         fs: FlowState | None = st.flows.pop(flow.id, None)
         if fs is None:
             return  # not recorded (refused, a CONNECT) or already written
-        row = rows.http_row(flow, fs.ident, st.config.scan_id, fs.n, fs.tag)
+        row = rows.http_row(flow, fs.ident, st.config.scan_id, fs.n, fs.tag, fs.replay_of)
         if extra.get("end_reason") == "proxy_shutdown":
             # in flight: a body that has not arrived yet is not a streamed one
             for side in ("req", "resp"):

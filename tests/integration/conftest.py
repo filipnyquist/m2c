@@ -13,6 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import servers  # noqa: E402
 
 M2C = str(Path(sys.executable).parent / "m2c")
+ROWS = ("import sys; from m2c.db import open_session; "
+        "sys.stdout.buffer.write(open_session(sys.argv[1], readonly=True).query(sys.argv[2], 'JSONEachRow').bytes())")
 
 
 class Proxy:
@@ -55,7 +57,8 @@ class Proxy:
         return self.proc.returncode
 
     def rows(self, sql: str) -> list[dict]:
-        out = self.m2c("sql", sql, "--format", "JSONEachRow")
+        """Query the stopped proxy's data directory (m2c has no SQL command; one chDB data path per process, so not here)."""
+        out = subprocess.run([sys.executable, "-c", ROWS, str(self.data), sql], env=self.env, check=True, capture_output=True).stdout
         return [json.loads(line) for line in out.splitlines() if line.strip()]
 
 
