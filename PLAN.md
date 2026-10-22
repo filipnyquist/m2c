@@ -20,6 +20,17 @@ M0–M7 are implemented. 79 tests cover them: unit tests, plus integration tests
   - gRPC errors count as failures.
   - Tunnels that aren't HTTP are `tcp_tunnel` events (plaintext gRPC gets a warning).
 - **HTTP/3:** investigated and not built. Proxy clients never use it; capturing it needs UDP interception, with WireGuard listeners per session as the candidate design.
+- **Next (M8–M16, 2026-10-22):** AI-agent ergonomics, a Preact + htm UI, annotations, a tool-call timeline and an opt-in repeater; see milestone list below.
+  - **M8 done:** one filter spec (`filters.SPEC`) behind the CLI, MCP, `/v1/filter-help` and the UI; `has:error` (transport, 5xx, gRPC) vs `has:fail` (adds 4xx) with matching SQL and Python predicates; `fmt.py` (flow lines, header redaction); `m2c mcp --session S`.
+  - **M9 done:** MCP tools in `mcp_tools.py`, async on the event loop (reads go to the reader lanes); `traffic_wait`, live `pending` fallback in `traffic_get`, compact `lines` search output, header redaction, scoped `traffic_events`; MCP 2025-11-25 with titles, annotations, structured content, resources and prompts; Origin and `MCP-Protocol-Version` checks.
+  - **M10 done:** `report` (by session, tool or call id), `grep` (RE2 in ClickHouse with context snippets, bodies or SSE/WebSocket data), `diff` (`diff.py`: headers without noise, JSON paths, unified text, hashes) over REST, MCP and the CLI.
+  - **M13 server side done:** a filter parser that keeps term spans (shared fixture for the UI's tokenizer), grouped negation `-( … )`, new keys `scheme:` `dur:` `size:` `hdr:` `rhdr:`, SPEC kinds and facets, `GET /v1/facets` and `GET /v1/suggest` (`suggest.py`), MCP `traffic_suggest`.
+  - **M12 + M13 UI done:** Preact + htm vendored (`scripts/vendor_ui.py`, checksums), static serving with a strict CSP and Trusted Types, a virtual flow table, live feed with generations and buffering, hash routes, the filter box with key and value suggestions and highlighting, hint chips, context menus, body viewers, live streams, export. Playwright tests in `tests/integration/test_ui.py`.
+  - **M16 done:** the repeater (`repeater.py`): opt-in `m2c_repeater` off|admin|on, mitmproxy's `ReplayHandler` awaited on the event loop with a timeout (recorded as an error), `replay_of` column, `has:replay`, `POST /v1/flows/N/resend`, MCP `traffic_replay` (listed only when allowed, returns a diff), `m2c resend`, the UI's Repeat tab with Compare. Limits: 4 in flight, 1 per caller, 60 a minute.
+  - **M15 done (changed 2026-10-23):** no `tool_calls` table and no call reports: m2c records only what goes through the proxy, never prompts, tool inputs or calls without traffic. The Claude Code hooks only tag traffic: SessionStart's `CLAUDE_ENV_FILE` snippet builds the proxy URL from a local call-id file that a Bash-only PreToolUse hook writes. The timeline (`timeline.py`, `/v1/timeline`, `m2c timeline`, `traffic_timeline`, the UI tab) groups flows by call id. Also: `m2c env` sets `NPM_CONFIG_CAFILE`, `PIP_CERT`, `CARGO_HTTP_CAINFO`, `DENO_CERT`; `m2c doctor` lists tools that failed TLS and where they read CAs.
+  - **M14 done:** `annotations` table (append-only versions), `notes.py` (validation, permissions, an overlay so a write reads back before the flush), `/v1/notes` and `/v1/flows/N/notes`, `label:` `note:` `has:note`, MCP `traffic_annotate`, `m2c note` / `m2c notes`, the UI's Notes tab and chips, push.
+  - **M13b done:** Sessions (`/v1/activity`), Events (`/v1/events/counts`, `fix` per event from `advice.py`) and Compare views, with tabs in the header.
+  - **Raw SQL removed (2026-10-23):** no `/v1/sql`, `m2c sql` or `traffic_sql`, and no SQL view. Everything goes through the filter language and the fixed queries; the data directory still opens with `clickhouse local` once the proxy has stopped.
 - **Not built:** Codex and Playwright example files (the README covers them), and the `CLAUDE_CODE_SHELL_PREFIX` per-command tool naming.
 
 A general-purpose recording proxy for **any AI agent or harness**: Claude Code, Codex, custom agents, LangChain apps, browser agents. It is not tied to one product.
@@ -420,7 +431,6 @@ It is compiled to parameterized SQL, never string-built. Free text searches `url
 | `GET /v1/flows/{n}/curl` | a curl command that replays the request (credentials stripped) |
 | `GET /v1/tail?q=` | SSE stream of new flows matching `q`, from the ring |
 | `GET /v1/har?q=` | HAR export of a filter |
-| `POST /v1/sql` | read-only SQL, `format=` JSONEachRow, TSV, Parquet or Arrow, streamed (admin only) |
 
 **API auth: two kinds of token**
 - **Admin token.** Made at startup and written to `<data>/api.json` (mode 0600, with the URL). It can do everything, including SQL.
@@ -439,7 +449,6 @@ It is compiled to parameterized SQL, never string-built. Free text searches `url
 | `m2c sse 1042` / `m2c ws 1042` | SSE events or WebSocket messages of one flow |
 | `m2c curl 1042` | a curl command that replays the request |
 | `m2c har [query] > x.har` | HAR export |
-| `m2c sql "…" [--format parquet]` | read-only SQL |
 | `m2c stats` | counters |
 
 - **Output:** human tables on a TTY, `--json` (JSON lines) for agents and scripts.
@@ -448,7 +457,7 @@ It is compiled to parameterized SQL, never string-built. Free text searches `url
 - **Two transports:**
   - Streamable HTTP served by the same API at `/mcp`, so a harness only needs a URL and a token. No extra process.
   - `m2c mcp` as a stdio shim that forwards to the API, for clients that only speak stdio.
-- **Tools:** `traffic_sessions`, `traffic_search(query, limit, cursor)`, `traffic_get(n, include_bodies, max_bytes)`, `traffic_sse(n)`, `traffic_ws(n)`, `traffic_stats`, plus `traffic_sql(sql)` with an admin token only.
+- **Tools:** `traffic_sessions`, `traffic_search(query, limit, cursor)`, `traffic_get(n, include_bodies, max_bytes)`, `traffic_sse(n)`, `traffic_ws(n)`, `traffic_stats`.
 - **Bounded output:** bodies are truncated (8 KB by default) with a hint on how to fetch more, and lists are summaries, so an agent's context doesn't fill up.
 - **Hand-rolled:** the JSON-RPC is a few hundred lines, so the `mcp` SDK isn't needed (it pulls in pydantic and starlette). Decide in M5.
 
@@ -550,7 +559,7 @@ tests/unit tests/integration tests/servers   # http, chunked+gzip SSE, ws echo, 
 - **M0, scaffold and spikes:**
   - pyproject, schema module, `m2c proxy` launching mitmdump with chDB opened
   - spikes: `chdb-core` without pandas/pyarrow; reader-pool latency while the writer is under load; `remoteSecure` push to a dockerized ClickHouse
-  - *Done when:* `m2c sql "select 1"` works.
+  - *Done when:* a query through the proxy's API works.
 - **M1, HTTP end to end:**
   - the state singleton, the writer (RowBinary, batching, retry), `http_flows` and `proxy_events`, `n` numbering
   - the 407 rules, `m2c env`
@@ -575,6 +584,14 @@ tests/unit tests/integration tests/servers   # http, chunked+gzip SSE, ws echo, 
 - **M7, ship:**
   - the bundle (x86_64 and aarch64), the container image, integrations (Claude Code, Codex, Playwright, generic)
   - load test, health rows, chaos tests, docs
+- **M8, consistency:** filter spec as data, one failure vocabulary, `fmt.py`, `m2c mcp --session`.
+- **M9, MCP v2:** async tool dispatch on the event loop, live fallback, `traffic_wait`, compact output, redaction, scoped events, MCP 2025-11-25 (annotations, structured output, resources, prompts).
+- **M10, analysis:** `report`, `grep` (RE2 in ClickHouse), `diff`.
+- **M11, dropped:** no LLM-call view. LLM traffic stays outside the proxy.
+- **M12–M13, UI:** Preact + htm vendored as ES modules, strict CSP, virtual table, deep links, sessions/events/diff views, autocomplete.
+- **M14, annotations:** the first write path (labels and notes per flow).
+- **M15, tool-call timeline:** flows grouped by call id; Claude Code hooks set the call id per Bash call. Nothing but proxied traffic is recorded (no tool-call table).
+- **M16, repeater:** opt-in edit and resend through mitmproxy's replay, recorded with `replay_of`.
 - **Later, if wanted:**
   - raw TCP/UDP/DNS tables
   - LLM-call extraction (JSON columns)

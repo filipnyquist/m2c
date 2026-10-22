@@ -147,8 +147,10 @@ class Agent:
     def __init__(self, proxy_port: int, data: Path, session: str):
         token = subprocess.run([M2C, "mint", session, "--data", str(data)], capture_output=True, text=True, check=True).stdout.strip()
         self.port, self.session, self.token = proxy_port, session, token
+        self.calls: dict[str, str] = {}  # tool -> the current call id (what the Claude Code hooks set per Bash call)
 
     def send(self, tool: str, method: str, url: str, body: dict | str | None = None, call: str = "") -> None:
+        call = call or self.calls.get(tool, "")
         user = f"{self.session}.{tool}" + (f".{call}" if call else "")
         auth = "Basic " + base64.b64encode(f"{user}:{self.token}".encode()).decode()
         headers = {"Proxy-Authorization": auth, "User-Agent": {"curl": "curl/8.5.0", "nuclei": "Nuclei - Open-source project",
@@ -184,8 +186,10 @@ def background(a: Agent, b: Agent) -> list:
         (a, "ffuf", "GET", "http://api.acme.test/wp-admin", None), (b, "python", "GET", "http://api.acme.test/v1/users/3", None),
         (a, "curl", "GET", "http://api.acme.test/v1/users", None), (a, "ffuf", "GET", "http://api.acme.test/.svn/entries", None),
     ]
+    a.calls = {"curl": "toolu_01KxR3", "nuclei": "toolu_01NvQ8", "ffuf": "toolu_01FzW2"}
     for agent, tool, method, url, body in before:
         agent.send(tool, method, url, body)
+    a.calls = {"curl": "toolu_01Lp6M", "nuclei": "toolu_01Tq4D", "ffuf": "toolu_01Hc9J"}
     return during
 
 
@@ -196,7 +200,12 @@ CURSOR_JS = """
   const c = document.createElement('div');
   c.id = 'demo-cursor';
   c.style.cssText = 'position:fixed;left:0;top:0;width:18px;height:18px;z-index:99999;pointer-events:none;transition:transform .05s linear;';
-  c.innerHTML = '<svg width="18" height="18" viewBox="0 0 18 18"><path d="M2 1 L2 15 L6 11 L9 17 L11 16 L8 10 L14 10 Z" fill="white" stroke="black" stroke-width="1.2"/></svg>';
+  // built with DOM calls: the UI's CSP (Trusted Types) refuses innerHTML
+  const ns = 'http://www.w3.org/2000/svg', svg = document.createElementNS(ns, 'svg'), path = document.createElementNS(ns, 'path');
+  for (const [k, v] of [['width', '18'], ['height', '18'], ['viewBox', '0 0 18 18']]) svg.setAttribute(k, v);
+  for (const [k, v] of [['d', 'M2 1 L2 15 L6 11 L9 17 L11 16 L8 10 L14 10 Z'], ['fill', 'white'], ['stroke', 'black'], ['stroke-width', '1.2']]) path.setAttribute(k, v);
+  svg.appendChild(path);
+  c.appendChild(svg);
   document.body.appendChild(c);
   document.addEventListener('mousemove', e => { c.style.transform = `translate(${e.clientX - 2}px, ${e.clientY - 1}px)`; });
 })();
@@ -223,7 +232,7 @@ async def record(ui: str, frames: Path, during: list, agents: tuple[Agent, Agent
         browser = await p.chromium.launch(channel="chrome")
         page = await browser.new_page(viewport={"width": WIDTH, "height": HEIGHT}, color_scheme="dark", device_scale_factor=1)
         await page.goto(ui)
-        await page.wait_for_selector("tr.row")
+        await page.wait_for_selector(".vbody .row")
         await page.evaluate(CURSOR_JS)
         await page.mouse.move(640, 420)
         stop = asyncio.Event()
@@ -247,22 +256,58 @@ async def record(ui: str, frames: Path, during: list, agents: tuple[Agent, Agent
         threading.Thread(target=trickle, daemon=True).start()
         await asyncio.sleep(1.2)
         b.stream("browser", "http://app.acme.test/events")              # a long-lived SSE stream opens
-        await page.wait_for_selector("tr.row.open", timeout=10000)
+        await page.wait_for_selector(".vbody .row.open", timeout=10000)
         await asyncio.sleep(0.8)
-        await click_on(page, page.locator("tr.row.open").first)          # watch its events arrive live
+        await click_on(page, page.locator(".vbody .row.open").first)     # watch its events arrive live
         await asyncio.sleep(4.5)
-        await click_on(page, page.locator("tr.row", has_text="/v1/users").first)  # a JSON response, pretty-printed
+        await click_on(page, page.locator(".vbody .row", has_text="/v1/users").first)  # a JSON response as a tree
+        await click_on(page, page.locator(".tabs .tab", has_text="Response"))
         await asyncio.sleep(2.2)
-        await click_on(page, page.locator("tr.row", has_text="/login").first)
-        await click_on(page, page.locator(".tabs button", has_text="Request"))   # what the tool sent
+        await click_on(page, page.locator(".vbody .row", has_text="/login").first)
+        await click_on(page, page.locator(".tabs .tab", has_text="Request"))     # what the tool sent
         await asyncio.sleep(1.8)
+        await click_on(page, page.locator(".tabs .tab", has_text="Repeat"))      # edit it and send it again
+        body = page.locator(".repeat textarea").nth(1)
+        await page.wait_for_function("() => (document.querySelectorAll('.repeat textarea')[1] || {}).value?.includes('OR')")
+        await click_on(page, body)
+        await body.press("Control+a")
+        await body.press_sequentially('{"user": "admin", "password": "x"}', delay=45)
+        await asyncio.sleep(0.6)
+        await click_on(page, page.locator(".repeat button", has_text="Send"))
+        await page.wait_for_selector(".repeat-result", timeout=10000)
+        await asyncio.sleep(1.2)
+        await click_on(page, page.locator(".repeat-result button", has_text="Compare"))  # what the quote changed
+        await page.wait_for_selector(".prow", timeout=10000)
+        await asyncio.sleep(3.2)
+        await click_on(page, page.locator(".view-tab", has_text="Flows"))
+        await page.wait_for_selector(".vbody .row")
+        await asyncio.sleep(0.8)
         q = page.locator("#q")
         await click_on(page, q)
-        await q.press_sequentially("status:4xx|5xx tool:nuclei|ffuf", delay=70)  # filter the table
-        await asyncio.sleep(2.6)
-        await q.fill("")
-        await q.press_sequentially("session:run-2c91", delay=70)
+        await q.press_sequentially("tool:", delay=90)                    # the values seen, with counts
+        await asyncio.sleep(1.4)
+        await q.press_sequentially("nu", delay=90)
+        await asyncio.sleep(0.6)
+        await q.press("Tab")                                             # picked and applied
         await asyncio.sleep(2.2)
+        await q.fill("")
+        await q.press("Enter")
+        await asyncio.sleep(1.2)
+        hint = page.locator("button.hint", has_text="hide them")         # a suggested refinement
+        if await hint.count():
+            await click_on(page, hint.first)
+            await asyncio.sleep(2.2)
+        await click_on(page, q)
+        await q.fill("")
+        await asyncio.sleep(0.3)
+        await q.press("Enter")
+        await page.wait_for_function("() => !location.hash.includes('q=')")
+        await asyncio.sleep(0.6)
+        await click_on(page, page.locator(".view-tab", has_text="Timeline"))  # flows grouped by the tool call that made them
+        await page.wait_for_selector(".tl-call", timeout=10000)
+        await asyncio.sleep(3.0)
+        await click_on(page, page.locator(".view-tab", has_text="Sessions"))
+        await asyncio.sleep(3.0)
         stop.set()
         await shooter
         await browser.close()
@@ -294,7 +339,8 @@ def main() -> None:
     up = start_upstream()
     proxy_port = free_port()
     # m2c's mitmdump command, with the demo add-on loaded first (so it restores hosts before m2c records)
-    printed = subprocess.run([M2C, "proxy", "--listen", f"127.0.0.1:{proxy_port}", "--api", "127.0.0.1:0", "--data", str(data), "--print"],
+    printed = subprocess.run([M2C, "proxy", "--listen", f"127.0.0.1:{proxy_port}", "--api", "127.0.0.1:0", "--data", str(data), "--repeater", "admin",
+                              "--print"],
                              capture_output=True, text=True, check=True).stdout.strip()
     argv = shlex.split(printed)
     s = argv.index("-s")

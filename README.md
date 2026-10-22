@@ -8,7 +8,7 @@ failures and TLS failures. Each row records **which agent session and which tool
 You can watch it live while the scan runs: there is an API, a CLI, an MCP server and a small web UI. At the end,
 the scan is pushed to a central ClickHouse, or kept as a directory that `clickhouse-local` opens.
 
-<p align="center"><img src="docs/demo.gif" alt="The m2c web UI: flows from two agent runs arrive live, an SSE stream's events appear while it is open, a 500 response and the SQL-injection request behind it are inspected, and the table is filtered by status, tool and session" width="100%"></p>
+<p align="center"><img src="docs/demo.gif" alt="The m2c web UI: flows from two agent runs arrive live, an SSE stream's events appear while it is open, the SQL-injection request behind a 500 is inspected, resent without the quote and compared with the original, the table is filtered with suggested values and a hint, and the timeline groups a run's flows by tool call before the sessions overview" width="100%"></p>
 <p align="center"><sub>Two agent runs through m2c, seen in the web UI (<code>docs/demo/make_gif.py</code> records it).</sub></p>
 
 ```
@@ -30,8 +30,8 @@ and API):
 
 ```bash
 TOKEN=$(m2c mint run42)                       # a token for session "run42"
-curl -x "http://run42.curl:$TOKEN@127.0.0.1:8080" --cacert ~/.mitmproxy/mitmproxy-ca-cert.pem https://example.com/
-m2c run --session run42 --tool nuclei -- nuclei -u https://example.com   # adds -proxy for you
+curl -x "http://run42.curl:$TOKEN@127.0.0.1:8080" --cacert ~/.mitmproxy/mitmproxy-ca-cert.pem https://api.acme.test/
+m2c run --session run42 --tool nuclei -- nuclei -u https://api.acme.test  # adds -proxy for you
 m2c ls                                        # newest flows
 m2c tail                                      # follow live
 m2c show 1                                    # one flow in full
@@ -79,7 +79,7 @@ proxy start) and spool files are 0600, because they hold every captured body, co
 | Harness | How |
 |---|---|
 | Any | `m2c run --session S --tool T -- cmd …`, or `eval "$(m2c env --session S --tool T)"` in the tool's shell. This sets `HTTP(S)_PROXY`, `ALL_PROXY`, `NO_PROXY`, `NODE_USE_ENV_PROXY=1` and the CA bundle variables (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`). The CA bundle goes to `<data>/ca-bundle.pem`, or to `~/.cache/m2c/` when the data directory isn't writable (a proxy running as another user). |
-| Claude Code | `m2c hooks claude-code` prints a SessionStart hook. Its Bash commands then go through the proxy as `<session_id>.bash`. |
+| Claude Code | `m2c hooks claude-code` prints a SessionStart hook and a PreToolUse hook for Bash. Each Bash call's requests then go through the proxy as `<session_id>.bash.<tool_use_id>`, so the timeline groups them per call. |
 | Browsers (Playwright and others) | context proxy option: `{server: 'http://127.0.0.1:8080', username: 'run42.browser', password: TOKEN}` |
 | nuclei, katana, httpx, sqlmap, ffuf | they ignore the environment variables; `m2c run` adds their proxy flags. httpx here means ProjectDiscovery's; the Python httpx CLI reads the environment and gets no flags. naabu gets none either, because its `-proxy` is SOCKS5 only. |
 
@@ -166,13 +166,36 @@ works after a crash: an `api.json` whose API doesn't answer is ignored.
 Used by the CLI, the API (`q=`), MCP and the UI:
 
 ```
-session:run42 tool:nuclei|ffuf call:c7 host:*.example.com method:POST status:5xx|404|>=400 path:/api/*
-ct:json ua:curl has:sse|ws|grpc|error|body err:timeout after:10m before:2026-10-21T12:00 n:100-200
-grpc:demo.v1.Demo/* gstatus:!0|INVALID_ARGUMENT|14
-body:"needle" -status:404 "free text in the URL"
+session:run42 tool:nuclei|ffuf call:c7 host:*.acme.test method:POST status:5xx|404|>=400 path:/api/*
+ct:json ua:curl has:sse|ws|grpc|error|fail|body err:timeout after:10m before:2026-10-21T12:00 n:100-200
+grpc:demo.v1.Demo/* gstatus:!0|INVALID_ARGUMENT|14 scheme:http dur:>2s size:>1m
+hdr:authorization hdr:x-api-key=*abc* rhdr:set-cookie label:vuln|todo note:"token reuse" has:note
+body:"needle" -status:404 -(tool:ffuf status:404) "free text in the URL"
 ```
 
+- Terms are ANDed, and `|` ORs the values of one term.
+- `-` negates a term, and `-( … )` negates a group of terms together: `-(tool:ffuf status:404)` hides ffuf's 404s and nothing else.
+- `dur:` (duration) and `size:` (response body) take `>`, `<`, `>=`, `<=` or `=`; a bare value means "at least". Units are ms/s/m/h, and k/m/g (1024-based).
+- `hdr:` and `rhdr:` match a request or response header by name, or by `name=value`; both parts take globs.
+
 `n:` takes `42` or `100-200` (decimal digits). Out-of-range numbers and times are rejected with HTTP 400.
+
+Two words for things going wrong, used the same way everywhere:
+- **error** (`has:error`, `errors` in the scan stats): a transport error, a 5xx, or a gRPC call that did not end OK.
+- **failure** (`has:fail`, `failures` in sessions and stats, red in the UI): an error or a 4xx.
+
+`transport_errors` in the stats counts only flows with no usable response. `GET /v1/filter-help` lists every key
+with an example; the MCP tool descriptions and the UI are built from the same list.
+
+**Suggestions** (`/v1/suggest`, `traffic_suggest`) come from aggregates over the flows a query matches:
+- noise to hide: a tool and status pair, a status, a host or a tool making up 40% or more of at least 20 flows, e.g. `-(tool:ffuf status:404)`;
+- failures (`has:fail`) and their main error kind (`err:timeout`);
+- credentials sent over plain HTTP (`scheme:http hdr:authorization|cookie|…`);
+- the slow tail (`dur:>2.3s`);
+- a session that makes up most of the traffic;
+- flows still open.
+
+A hint never repeats a term the query already has. Facets and suggestions are cached for 5 seconds per token.
 
 ### CLI
 
@@ -182,12 +205,18 @@ body:"needle" -status:404 "free text in the URL"
 | `m2c tail [query]` | live: long-lived flows when they start, every flow when it ends |
 | `m2c show N [--body\|--req-body] [--max B]` | one flow; `--body` writes the raw response body to stdout |
 | `m2c sessions [query]` | per session and tool: flows, failures, hosts, bytes |
+| `m2c resend N [-X METHOD] [--url U] [-H 'Name: value'] [--drop-header NAME] [-d BODY]` | resend a recorded request, edited or not (`m2c proxy --repeater`) |
+| `m2c timeline [session]` | a session's flows grouped by the tool call that made them |
+| `m2c notes [query]` | labels and notes on the flows a query matches |
+| `m2c note N [-l LABEL] [--color C] [text…]`, `--edit ID`, `--delete ID` | label or note a flow (through the running proxy) |
+| `m2c report [query] [--by session\|tool\|call]` | per group: flows, failures, hosts, status codes, error kinds, the slowest flows |
+| `m2c grep PATTERN [query] [-E] [-s] [--side req\|resp] [--in sse\|ws]` | text in bodies (or SSE/WebSocket data), shown in context; literal unless `-E` (RE2) |
+| `m2c diff A B` | what differs between two flows: request, status, headers, bodies (JSON paths or a text diff), timing |
 | `m2c sse N`, `m2c ws N` | SSE events or WebSocket messages of a flow |
 | `m2c grpc N [--proto F]` | the messages of a gRPC call, decoded from protobuf |
 | `m2c curl N` | a curl command that replays the request. The body goes in `--data-raw` (or through stdin when binary) and the URL isn't globbed, so replaying a captured payload never reads local files. |
 | `m2c har [query] > out.har` | HAR export |
 | `m2c events [--kind auth_rejected]` | proxy events |
-| `m2c sql "SELECT …" [--format Parquet]` | read-only SQL |
 | `m2c stats` | totals and writer counters |
 
 Every lookup command takes `--json` (JSON lines) for scripts and agents. The CLI talks to the API with the standard
@@ -197,8 +226,8 @@ library only and never loads chDB while a proxy is running.
 
 The API listens on `m2c_api_listen`, `127.0.0.1:8124` by default. Requests need `Authorization: Bearer <token>`:
 
-- **Admin token:** in `<data>/api.json` and printed at startup; it stays the same across restarts of one data directory. It can do everything, including SQL.
-- **`<session>:<proxy token>`:** sees only that session. No SQL, no proxy events.
+- **Admin token:** in `<data>/api.json` and printed at startup; it stays the same across restarts of one data directory. It can see every session.
+- **`<session>:<proxy token>`:** sees only that session, and only the proxy events that concern it.
 
 | Endpoint | Returns |
 |---|---|
@@ -211,7 +240,20 @@ The API listens on `m2c_api_listen`, `127.0.0.1:8124` by default. Requests need 
 | `GET /v1/flows/N/curl`, `GET /v1/har?q=` | replay command, HAR export |
 | `GET /v1/tail?q=&backlog=` | **SSE stream:** `open` when a long-lived flow starts, `flow` when any flow ends, `stats` every 2 s |
 | `GET /v1/flows/N/live` | **SSE stream:** the SSE events or WebSocket messages of an open flow as they happen, then `end` |
-| `POST /v1/sql?format=` | read-only SQL (admin) |
+| `GET /v1/events?kind=&severity=&limit=` | proxy events, each with a `fix` (what to do); a session token sees its own and the rejected attempts that named it (`claimed`) |
+| `POST /v1/flows/N/resend` | resend flow N: `{method?, url?, headers?, headers_remove?, body? \| body_base64?}` → the new flow's `n`, status, error |
+| `GET /v1/timeline?session=&limit=` | a session's last flows grouped by call id; `/v1/timeline/sessions` lists the sessions that have call ids |
+| `GET /v1/notes?ns=1,2,3` or `?q=` | notes on those flows, or on the flows a filter matches |
+| `GET`/`POST /v1/flows/N/notes` | a flow's notes; add one: `{"label": "vuln", "color": "red", "note": "…"}` |
+| `PATCH`/`DELETE /v1/notes/ID` | change or delete a note (its author, or the admin token) |
+| `GET /v1/events/counts?since=` | per kind and severity: count, and `recent` (after `since`, ms) |
+| `GET /v1/activity?q=&buckets=` | per session, flows and failures in equal time slices of the span the matching flows cover |
+| `GET /v1/filter-help` | every filter key with an example, help text, its kind and preset values |
+| `GET /v1/facets?key=&prefix=&q=&limit=` | autocomplete: the values of one key among the flows matching `q`, with counts; `path` suggests one more segment than typed |
+| `GET /v1/suggest?q=` | hints for refining `q`, each with the full refined query (see below) |
+| `GET /v1/report?q=&by=session\|tool\|call` | grouped summary (see `m2c report`) |
+| `GET /v1/grep?pattern=&regex=&ci=&side=&in=&q=&context=` | matches with context snippets; RE2, so a pattern cannot stall the server |
+| `GET /v1/diff?a=&b=&redact=` | the comparison of two flows; noisy headers (dates, request ids) are left out |
 | `POST /mcp` | MCP over Streamable HTTP |
 | `GET /ui/` | the web UI |
 
@@ -224,7 +266,7 @@ A flow shows up in about a millisecond, before it's even written to disk. Everyt
 A reconnecting tail resumes from its `Last-Event-ID`.
 
 **Queries** run on two small pools of read-only chDB sessions (`readonly=1`): one for interactive reads, one for
-heavy work (SQL, HAR, `body:` searches). A slow query never blocks `ls` or the UI, and a session token gets a
+heavy work (HAR, reports, grep, `body:` searches). A slow query never blocks `ls` or the UI, and a session token gets a
 limited share of each pool.
 
 The sessions can't write, change settings or read local files with `file()`/`url()`.
@@ -241,41 +283,150 @@ The sessions can't write, change settings or read local files with `file()`/`url
 
 - **Over HTTP:** `POST /mcp` on the API, with the same tokens.
 - **Over stdio:** `m2c mcp`. It forwards to the live API, or reads a stopped scan.
+  - Without `--token`, it runs as **admin**: every session. It says so on stderr.
+  - `m2c mcp --session S` mints S's token from the secret and sees only S's flows. Give an agent this form.
 
 **Tools:**
-- `traffic_stats`, `traffic_sessions`, `traffic_search`
-- `traffic_get`: bodies are cut at `max_bytes`, 8 KiB by default
-- `traffic_sse`, `traffic_ws`, `traffic_grpc` (decoded gRPC messages), `traffic_curl`
-- `traffic_sql`: admin token only
+- `traffic_wait`: returns once a flow matching a filter finishes. Call it right after making a request.
+  - By default it also counts flows that finished in the last 10 seconds.
+  - It returns a cursor; pass it as `after` to wait for the next ones.
+  - It waits on the event loop, not on a database reader, for up to 50 seconds.
+- `traffic_search`: one line per flow (`format: json` for summaries, cut to `fields`); 20 by default, newest first (`order: asc` for oldest first).
+- `traffic_get`: one flow in full.
+  - Bodies are cut at `max_bytes`, 4 KiB by default.
+  - Credential headers (Authorization, Cookie, API keys) show as `<redacted len=N sha256:…>`, so two values can still be compared. `redact: false` shows them.
+  - A flow that is still running, such as a stream, comes back as `pending` with its summary.
+- `traffic_replay`: resend a flow, edited or not, and get a diff against the original; listed only when the repeater is on for the caller
+- `traffic_timeline`: a session's flows grouped by the tool call that made them
+- `traffic_annotate`: put a label and/or a note on a flow (or delete one of yours); `traffic_get` shows a flow's notes
+- `traffic_suggest`: ways to refine a filter, each with the full query (the same hints as `/v1/suggest`)
+- `traffic_report` (by session, tool or call id), `traffic_grep` (body text in context), `traffic_diff` (two flows compared)
+- `traffic_events`: auth rejections, TLS failures and tunnels. A session token sees its own, plus rejected attempts that named its session (`claimed`, because a rejected username proves nothing).
+- `traffic_stats`, `traffic_sessions`, `traffic_sse`, `traffic_ws`, `traffic_grpc` (decoded gRPC messages), `traffic_curl`
+
+Every tool has a title and read-only annotations. `traffic_get`, `traffic_wait` and `traffic_stats` also return
+structured content.
+
+**Resources and prompts:**
+- Resources: `m2c://scan`, `m2c://flow/{n}` (a flow as JSON, without bodies), and `m2c://flow/{n}/body/{req|resp}`.
+- Prompts: `investigate_failures`, `summarize_run` and `explain_flow`.
 
 An agent given its own `<session>:<token>` can inspect its own traffic and nothing else.
 
-Over HTTP, a body that isn't JSON gets HTTP 400 with JSON-RPC error -32700, and an empty batch gets -32600. A bad
-element in a batch only gets its own error reply.
+**Over HTTP:**
+- A body that isn't JSON gets HTTP 400 with JSON-RPC error -32700, and an empty batch gets -32600.
+- A bad element in a batch only gets its own error reply.
+- Batches are refused when `MCP-Protocol-Version` is 2025-06-18 or later, because the spec dropped them.
+- A request with a foreign `Origin` gets 403.
+- Protocol versions supported: 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05.
 
 ```json
-{"mcpServers": {"traffic": {"command": "m2c", "args": ["mcp", "--data", "/data/scan"]}}}
+{"mcpServers": {"traffic": {"command": "m2c", "args": ["mcp", "--data", "/data/scan", "--session", "run42"]}}}
 ```
+
+### Tool calls: the timeline
+
+A flow's call id is the third part of its proxy username, `<session>.<tool>.<call>` (or the `x-m2c-call` header).
+The timeline (`m2c timeline`, `/v1/timeline`, `traffic_timeline`, the UI's Timeline tab) groups a session's flows by
+it, in order; flows without one sit between the calls.
+
+For Claude Code, `m2c hooks claude-code` sets the call id to each Bash call's `tool_use_id`:
+- **SessionStart** writes `CLAUDE_ENV_FILE`, which Claude Code runs as shell code before every Bash command. Next to
+  the usual proxy variables it builds the proxy URL from a one-line local file (in `$XDG_RUNTIME_DIR/m2c/`) holding the
+  current call's id. It also exports `M2C_SESSION`, `M2C_API` and a session-scoped `M2C_API_TOKEN`, so the tools
+  can look up their own traffic.
+- **PreToolUse** (Bash only) writes that file. It sends nothing anywhere and takes about 60 ms.
+
+m2c records only what goes through the proxy. It never stores prompts, tool inputs, commands, tool output, or
+calls that made no requests: a call exists in m2c only through its traffic. With parallel Bash calls the file holds
+the latest call's id, so a flow can carry a sibling call's id.
+
+### The repeater
+
+Resend a recorded request, as recorded or edited: method, URL, headers, body. It is off by default:
+- `m2c proxy --repeater admin`: the admin token only;
+- `--repeater on`: also a session token, for its own session's flows. That is no more than the session could do through the proxy itself.
+
+**How it works:**
+- The request leaves from the proxy, through mitmproxy's own replay, with the proxy's upstream settings.
+- It is recorded in the original's session as tool `repeater`, with call id and `replay_of` set to the original's number. `has:replay` finds such flows.
+- Proxy credentials, `x-m2c-*` and hop-by-hop headers are never sent on. A body stored decoded is encoded again per its `Content-Encoding`.
+- A request whose stored body was cut at the body cap needs its body given.
+- Without a complete response within `m2c_repeater_timeout`, it is recorded as an error.
+
+**Limits:** four at once, one per caller, 60 a minute per caller.
+
+**Where:** the UI's Repeat tab (then *Compare*), `m2c resend`, `POST /v1/flows/N/resend`, MCP `traffic_replay`.
+
+### Labels and notes
+
+The one thing m2c lets its readers write. A note has a label (`vuln`, `todo`, `auth-bypass`: lower case, up to 32
+characters), a color, and text, and belongs to one flow.
+- **Who:** the admin token on any flow; a session token on its own session's flows, and it edits only its own notes.
+  An agent can label what it found with `traffic_annotate`, and a person reviewing the run sees it in the UI.
+- **Finding them:** `label:vuln`, `note:"token reuse"`, `has:note`; label values are suggested in the filter box.
+- **Storage:** the `annotations` table, append-only: an edit or a delete is a new version of the same id. A note
+  reads back at once, before the writer's next flush. It is pushed to central with the scan. Upgrading a central
+  database: run `m2c central init` again, which adds the table.
 
 ### Web UI
 
-**Layout:**
-- left: sessions and tools
-- middle: a live flow table, filtered with the same filter language
-- right: details, with headers, pretty JSON, hex for binary data and image previews
+Served at `/ui/` (turn it off with `--no-ui`). Open the link `m2c proxy` prints: it carries the admin token once, then
+keeps it in the tab's session storage.
 
-**Streams:** SSE and WebSocket flows appear while they are still open. Selecting one streams its events live and
-backfills what came before. curl and HAR export are one click.
+**Views** (tabs in the header):
+- **Flows:**
+  - left: sessions and tools, with flow and failure counts;
+  - middle: the flow table, live; it stays fast with any number of flows, because only the rows in view are drawn;
+  - right: one flow: overview (timing, identity, connection, gRPC), request, response, stream, export.
+- **Timeline:** a session's flows grouped by the tool call that made them (see above), with hosts, failures and duration per call.
+- **Sessions:**
+  - every session with an activity strip (flows and failures over time), flows, failure rate, hosts, bytes, first and last seen;
+  - expand one for its tools; the selected one gets a report on the right (status mix, per tool, hosts, slowest flows);
+  - the filter box and the quick ranges (all, last hour, 15 min) narrow every number.
+- **Events:**
+  - what never became a flow: rejected logins, failed TLS handshakes, tunnels that aren't HTTP, health;
+  - by kind and severity, each with what to do (e.g. which CA variable the tool that failed TLS reads);
+  - the tab's badge counts new warnings since you last looked.
+- **Compare** (`#/diff/A/B`):
+  - two flows side by side: status, timing, sizes, identity, headers with credentials redacted, and bodies as JSON paths, a unified diff or side by side;
+  - open it by right-clicking a flow while another is selected (*Compare with #N*), or with *Compare with…* in a flow's overview.
 
-**No build step:** it is one static page, served at `/ui/` (turn it off with `--no-ui`).
+**Filtering while you type:**
+- The filter box completes keys with their help, then the values seen among the current results, with counts.
+  - `tool:` lists the tools; `path:` offers one more segment at a time.
+  - Tab accepts a suggestion, Enter runs the query, Esc closes the list or reverts.
+- The query is highlighted, and one the server rejects shows its message without being applied.
+- Under the box, suggested refinements from the data come as one-click chips, e.g. "312 of 410 are ffuf 404s: hide them".
+- Right-click any value (a cell, an overview field, a header) to filter to it, exclude it, or copy it. Alt+click filters, Alt+Shift+click excludes.
+- The detail view has *More like this*, *Same call* and *Hide these*.
+- The query, the selected flow and the tab are in the address (`#/flows?q=…&n=…&tab=…`): links can be shared, and Back undoes a filter.
+
+**Notes:** the selected flow's Notes tab (or `a`) adds a label and a note; labels show as chips in the flow list.
+
+**Bodies:** a collapsible JSON tree, text with search, a hex view for binary data, and image previews. Captured
+content is only ever shown as text.
+
+**Streams:** SSE, WebSocket and gRPC flows appear while they are still open. Selecting one streams its events live
+and backfills what came before.
+
+**Export:** a flow's request as curl, `fetch`, Python `requests`, raw HTTP or HAR; the filtered list as HAR.
+
+**Keys:** `/` filter, `j`/`k` or arrows to move, `[`/`]` tabs, `g`/`G` first/last, `l` live on/off, `t` theme
+(auto, light, dark), `?` help.
+
+**No build step:** Preact and htm are vendored as ES modules in `src/m2c/ui/vendor/`, pinned with checksums
+(`scripts/vendor_ui.py` fetches and checks them).
+- The CSP allows only those files: no inline script or style, no `eval`, Trusted Types on.
+- Files are revalidated on every load, so an upgraded proxy never serves a stale mix.
 
 ## Push to a central ClickHouse
 
 ```bash
 export M2C_PUSH_PASSWORD=…
-m2c central init --to https://m2c@ch.example.com:8443/m2c     # create or upgrade the central schema
-m2c push --to clickhouses://m2c@ch.example.com:9440/m2c --label env=ci --label repo=foo
-m2c proxy --push-on-exit https://m2c@ch.example.com:8443/m2c  # or push automatically at shutdown
+m2c central init --to https://m2c@ch.acme.test:8443/m2c     # create or upgrade the central schema
+m2c push --to clickhouses://m2c@ch.acme.test:9440/m2c --label env=ci --label repo=foo
+m2c proxy --push-on-exit https://m2c@ch.acme.test:8443/m2c  # or push automatically at shutdown
 ```
 
 **How it works:**
@@ -294,9 +445,8 @@ m2c proxy --push-on-exit https://m2c@ch.example.com:8443/m2c  # or push automati
 ReplicatedMergeTree`, `--on-cluster` and `--ttl-days` are available. `m2c central ddl` prints the SQL instead of
 running it.
 
-**Without a central server:**
-- `m2c sql "…" --format Parquet > x.parquet` exports a table
-- or ship the directory: it opens with `clickhouse local --path <data>`
+**Without a central server:** ship the stopped scan's directory; it opens with `clickhouse local --path <data>`, and
+`m2c har` exports the flows a filter matches.
 
 ## Install and run
 
@@ -337,6 +487,9 @@ to see the mitmdump command. Commonly used options:
 | `m2c_api_hosts` | — |
 | `m2c_readers` | 3 |
 | `m2c_ui` | `true` |
+| `m2c_annotations` | `true` (labels and notes through the API; `false` makes them read-only) |
+| `m2c_repeater` | `off`; `admin` or `on` (`m2c proxy --repeater`) |
+| `m2c_repeater_timeout` | 30 s |
 | `m2c_push_on_exit` | — |
 | `m2c_labels` | — |
 | `m2c_grpc_msg_cap`, `m2c_grpc_max_messages` | 256 KiB, 100 000 per call |
@@ -361,6 +514,9 @@ uv run pytest                 # unit + integration (starts real proxies); push t
 docker run -d --name m2c-central -p 127.0.0.1:18123:8123 -p 127.0.0.1:19000:9000 \
   -e CLICKHOUSE_USER=m2c -e CLICKHOUSE_PASSWORD=centralpw clickhouse/clickhouse-server:26.3-alpine
 ```
+
+The UI tests (`tests/integration/test_ui.py`) drive a real Chromium through Playwright; they are skipped when no
+browser is available (`uv run playwright install chromium`).
 
 The design and its reasoning are in `PLAN.md`; benchmarks are in `PERFORMANCE.md` (`bench/bench.py`).
 
