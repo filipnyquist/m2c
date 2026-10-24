@@ -11,7 +11,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import identity
+from . import __version__, identity
 from .fmt import flow_line as _flow_line, report_text, size as _size, when as _when
 
 DEFAULT_PROXY = "127.0.0.1:8080"
@@ -827,6 +827,7 @@ def cmd_central(args) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="m2c", description=__doc__)
+    p.add_argument("--version", action="version", version=f"m2c {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp, proxy=False):

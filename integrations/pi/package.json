@@ -1,0 +1,14 @@
+{
+  "name": "m2c-pi",
+  "version": "0.1.0",
+  "description": "Record your pi session's HTTP traffic with m2c (mitmproxy2chDB) and give the model the recorded traffic back",
+  "keywords": ["pi-package", "m2c", "traffic", "proxy", "mitmproxy"],
+  "type": "module",
+  "pi": {
+    "extensions": ["./extensions/m2c-bridge.ts"],
+    "skills": ["./skills/m2c-traffic"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

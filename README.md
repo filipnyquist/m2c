@@ -80,6 +80,7 @@ proxy start) and spool files are 0600, because they hold every captured body, co
 |---|---|
 | Any | `m2c run --session S --tool T -- cmd …`, or `eval "$(m2c env --session S --tool T)"` in the tool's shell. This sets `HTTP(S)_PROXY`, `ALL_PROXY`, `NO_PROXY`, `NODE_USE_ENV_PROXY=1` and the CA bundle variables (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`). The CA bundle goes to `<data>/ca-bundle.pem`, or to `~/.cache/m2c/` when the data directory isn't writable (a proxy running as another user). |
 | Claude Code | `m2c hooks claude-code` prints a SessionStart hook and a PreToolUse hook for Bash. Each Bash call's requests then go through the proxy as `<session_id>.bash.<tool_use_id>`, so the timeline groups them per call. |
+| Pi | `pi install git:github.com/filipnyquist/m2c` installs the pi extension: it starts a recording proxy per session, runs the session's bash commands through it, and gives the model m2c's MCP tools. See [Pi](#pi) below. |
 | Browsers (Playwright and others) | context proxy option: `{server: 'http://127.0.0.1:8080', username: 'run42.browser', password: TOKEN}` |
 | nuclei, katana, httpx, sqlmap, ffuf | they ignore the environment variables; `m2c run` adds their proxy flags. httpx here means ProjectDiscovery's; the Python httpx CLI reads the environment and gets no flags. naabu gets none either, because its `-proxy` is SOCKS5 only. |
 
@@ -88,6 +89,22 @@ runs, never for the harness process itself. `m2c doctor` warns when the current 
 
 `m2c env` and `m2c run` find a running proxy's address in `<data>/api.json`. Otherwise pass `--proxy` or set
 `M2C_PROXY`.
+
+### Pi
+
+`pi install git:github.com/filipnyquist/m2c` installs the pi extension (and the `m2c-traffic` skill) from this
+repository: the root `package.json` is the pi package, its manifest points at `integrations/pi/`. The extension
+needs the m2c CLI on `PATH` (`uv tool install git+https://github.com/filipnyquist/m2c`).
+
+On every session it starts a recording proxy (or attaches to one that already runs for the same scan directory),
+runs the session's bash commands through it, and registers m2c's MCP server for that session. Each bash command's
+requests carry the tool call's id, so the timeline groups them per call. The model reads the traffic back with the
+`traffic_*` tools, and `/m2c` prints the proxy's address, the scan directory, the UI link and the scan's counters.
+
+The proxy it starts has the repeater on, so the model can resend a recorded request (`traffic_replay`) and get the
+diff against the original. That sends a real request to the target. The extension's configuration
+(`M2C_BRIDGE`, `M2C_DATA`, `M2C_BIN`, `M2C_LISTEN`, `M2C_API_LISTEN`, `M2C_REPEATER`) is in
+`integrations/pi/README.md`.
 
 ## What is recorded
 
@@ -456,6 +473,17 @@ running it.
 | Linux bundle | `packaging/bundle.sh` builds `dist/m2c-<v>-linux-<arch>.tar.zst`. It contains a standalone CPython with everything installed, relocatable (the scripts in `m2c/python/bin` too), for glibc 2.17 or later (no Alpine). Untar it anywhere and run `m2c/bin/m2c`. |
 | Container | `docker build -t m2c .` then `docker run -p 127.0.0.1:8080:8080 -p 127.0.0.1:8124:8124 -v m2c:/data m2c` |
 | Inside another image | `COPY --from=m2c /opt/m2c /opt/m2c` and `ENV PATH=/opt/m2c/bin:$PATH` |
+
+**macOS 27:** chDB's macOS arm64 wheel does not load under macOS 27 (build 26A428): dyld requires the Mach-O
+`LINKEDIT` string pool to be 8-byte aligned and the published wheel is only 4-byte aligned
+([chdb-io/chdb#649](https://github.com/chdb-io/chdb/issues/649)). Until a fixed wheel ships, use the nightly chDB
+build, which is relinked with the fix:
+
+```bash
+uv pip install --python "$(dirname "$(readlink -f "$(which m2c)")")/../bin/python" \
+  https://github.com/chdb-io/chdb-core/releases/download/nightly/chdb-4.5.0.dev2610220507-py3-none-any.whl \
+  https://github.com/chdb-io/chdb-core/releases/download/nightly/chdb_core-26.11.0.dev2610220507-cp39-abi3-macosx_11_0_arm64.whl
+```
 
 **Sizes:** the bundle is about 205 MB compressed and 725 MB unpacked, almost all of it chDB's engine. The bundle
 leaves out chDB's pandas and pyarrow dependencies, which m2c never uses.

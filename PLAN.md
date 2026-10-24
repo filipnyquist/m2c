@@ -31,6 +31,7 @@ M0–M7 are implemented. 79 tests cover them: unit tests, plus integration tests
   - **M14 done:** `annotations` table (append-only versions), `notes.py` (validation, permissions, an overlay so a write reads back before the flush), `/v1/notes` and `/v1/flows/N/notes`, `label:` `note:` `has:note`, MCP `traffic_annotate`, `m2c note` / `m2c notes`, the UI's Notes tab and chips, push.
   - **M13b done:** Sessions (`/v1/activity`), Events (`/v1/events/counts`, `fix` per event from `advice.py`) and Compare views, with tabs in the header.
   - **Raw SQL removed (2026-10-23):** no `/v1/sql`, `m2c sql` or `traffic_sql`, and no SQL view. Everything goes through the filter language and the fixed queries; the data directory still opens with `clickhouse local` once the proxy has stopped.
+- **Pi (2026-10-24):** the pi extension lives in `integrations/pi/`, and the repository root is the pi package (a `package.json` with a `pi` manifest), so `pi install git:github.com/filipnyquist/m2c` installs the extension and the `m2c-traffic` skill. The extension starts a recording proxy per session, runs the session's bash commands through it, tags each call's traffic with the call id (the timeline), and registers a session-scoped MCP server. Its proxy starts with the repeater on, so the model can resend a recorded request; the proxy's output goes to `<data>/proxy.log`. `m2c --version` was added for the extension's version check.
 - **Not built:** Codex and Playwright example files (the README covers them), and the `CLAUDE_CODE_SHELL_PREFIX` per-command tool naming.
 
 A general-purpose recording proxy for **any AI agent or harness**: Claude Code, Codex, custom agents, LangChain apps, browser agents. It is not tied to one product.
@@ -514,6 +515,7 @@ src/m2c/
   client.py cli.py        # stdlib API client; m2c proxy|mint|env|run|ls|show|tail|sql|har|push|export|mcp|doctor|hooks
 packaging/bundle.sh       # python-build-standalone + venv -> tar.zst (x86_64, aarch64)
 Dockerfile                # python:3.12-slim + bundle
+integrations/pi/               # the pi extension: package.json + extension + skill (pi install git:github.com/filipnyquist/m2c)
 integrations/claude-code/ integrations/codex/ integrations/playwright/ integrations/generic/
 tests/unit tests/integration tests/servers   # http, chunked+gzip SSE, ws echo, central CH (docker)
 ```
