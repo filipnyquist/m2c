@@ -474,6 +474,17 @@ running it.
 | Container | `docker build -t m2c .` then `docker run -p 127.0.0.1:8080:8080 -p 127.0.0.1:8124:8124 -v m2c:/data m2c` |
 | Inside another image | `COPY --from=m2c /opt/m2c /opt/m2c` and `ENV PATH=/opt/m2c/bin:$PATH` |
 
+**macOS 27:** chDB's macOS arm64 wheel does not load under macOS 27 (build 26A428): dyld requires the Mach-O
+`LINKEDIT` string pool to be 8-byte aligned and the published wheel is only 4-byte aligned
+([chdb-io/chdb#649](https://github.com/chdb-io/chdb/issues/649)). Until a fixed wheel ships, use the nightly chDB
+build, which is relinked with the fix:
+
+```bash
+uv pip install --python "$(dirname "$(readlink -f "$(which m2c)")")/../bin/python" \
+  https://github.com/chdb-io/chdb-core/releases/download/nightly/chdb-4.5.0.dev2610220507-py3-none-any.whl \
+  https://github.com/chdb-io/chdb-core/releases/download/nightly/chdb_core-26.11.0.dev2610220507-cp39-abi3-macosx_11_0_arm64.whl
+```
+
 **Sizes:** the bundle is about 205 MB compressed and 725 MB unpacked, almost all of it chDB's engine. The bundle
 leaves out chDB's pandas and pyarrow dependencies, which m2c never uses.
 
