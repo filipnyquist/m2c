@@ -282,6 +282,18 @@ def test_proxy_passes_labels_as_json(tmp_path, capsys):
     assert parse_labels(labels.split("=", 1)[1]) == {"q": "a,b=c", "k": "v"}
 
 
+# ------------------------------------------------------------------ version
+
+
+def test_version_prints_the_package_version(capsys):
+    from m2c import __version__
+
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--version"])
+    assert e.value.code == 0
+    assert capsys.readouterr().out.strip() == f"m2c {__version__}"
+
+
 # ------------------------------------------------------------------ data directory permissions
 
 
